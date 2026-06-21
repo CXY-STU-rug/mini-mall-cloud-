@@ -67,6 +67,22 @@ feign:
   sentinel:
     enabled: true
 
+# ─── G5: Seata AT 分布式事务客户端 (file 模式直连 TC) ────────
+seata:
+  enabled: true
+  application-id: ${spring.application.name}
+  tx-service-group: default_tx_group
+  enable-auto-data-source-proxy: true
+  service:
+    vgroup-mapping:
+      default_tx_group: default
+    grouplist:
+      default: 127.0.0.1:8091
+  registry:
+    type: file
+  config:
+    type: file
+
 # ─── MyBatis-Plus ───────────────────────────────────────────────
 mybatis-plus:
   configuration:

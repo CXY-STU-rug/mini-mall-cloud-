@@ -22,6 +22,7 @@ import com.minimall.order.util.RedisLockUtil;
 import com.minimall.order.vo.OrderDetailVO;
 import com.minimall.order.vo.OrderItemVO;
 import com.minimall.order.vo.OrderListVO;
+import io.seata.spring.annotation.GlobalTransactional;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -84,7 +85,16 @@ public class OrdersServiceImpl extends ServiceImpl<OrdersMapper, Orders> impleme
     // ① 创建订单 (大头, 7 步 + 锁 + 事务 + 事务外发 MQ)
     // ════════════════════════════════════════════════════════════
     @Override
+    @GlobalTransactional(name = "createOrder-tx", rollbackFor = Exception.class)
     public Map<String, Object> createOrder(Long userId, CreateOrderDTO dto) {
+
+        // ⭐ G5: @GlobalTransactional 入口
+        //   - Seata TM 在这分配全局 XID
+        //   - Feign 自动透传 XID 到 product
+        //   - product 扣库存写 undo_log, 一阶段本地提交
+        //   - 本方法抛任何异常 → TC 反向通知 product 走 undo_log 回滚 stock
+        //   - 内部 TransactionTemplate 不动 (它是 order 本地事务,
+        //     作为全局事务的一个分支自动管理)
 
         // 同用户 10 秒内只能下一单 (防重复下单, 防双击)
         String lockKey = "lock:order:user:" + userId;

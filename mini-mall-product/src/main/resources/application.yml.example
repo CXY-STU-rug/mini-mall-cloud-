@@ -42,6 +42,22 @@ spring:
     username: root
     password: YOUR_MYSQL_PASSWORD   # ⭐ 改这里
 
+# ─── G5: Seata 客户端 (分支事务 RM) ────────────────────────
+seata:
+  enabled: true
+  application-id: ${spring.application.name}
+  tx-service-group: default_tx_group
+  enable-auto-data-source-proxy: true
+  service:
+    vgroup-mapping:
+      default_tx_group: default
+    grouplist:
+      default: 127.0.0.1:8091
+  registry:
+    type: file
+  config:
+    type: file
+
 mybatis-plus:
   configuration:
     log-impl: org.apache.ibatis.logging.stdout.StdOutImpl

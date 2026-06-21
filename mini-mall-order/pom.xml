@@ -94,10 +94,16 @@
             <optional>true</optional>
         </dependency>
 
-        <!-- ─── 暂时不引 ─────────────────────────────────────────────
-             spring-boot-starter-amqp → G2 接 RabbitMQ 时加
-             这就是 feedback_concrete_first: 用到再加, 不预先准备
-             ───────────────────────────────────────────────────────── -->
+        <!-- ⭐ G5 新增: Seata AT 分布式事务客户端
+             - 注册到本地 Seata Server (127.0.0.1:8091)
+             - 自动代理数据源, 拦截 SQL 写 undo_log
+             - @GlobalTransactional 由 starter 自动装配 GlobalTransactionScanner
+             版本由 spring-cloud-alibaba BOM 锁 -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
+        </dependency>
+
     </dependencies>
 
     <!-- ═══════════════════════════════════════════════════════════

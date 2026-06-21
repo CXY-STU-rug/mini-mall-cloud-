@@ -56,6 +56,14 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis</artifactId>
         </dependency>
+
+        <!-- ⭐ G5 新增: Seata AT 分布式事务客户端
+             product 作为分支事务(RM): 拿全局 XID, 扣库存被代理写 undo_log,
+             order 抛异常时收到 TC 回滚通知, 自动恢复 stock -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
+        </dependency>
     </dependencies>
 
     <build>
