@@ -29,12 +29,13 @@ log/
 Thumbs.db
 desktop.ini
 
-# --- ⭐ 含密码的 application.yml (4 个微服务全部排除) ---
+# --- ⭐ 含密码的 application.yml (5 个微服务全部排除) ---
 # 提交对应的 application.yml.example 给读者参考
 mini-mall-gateway/src/main/resources/application.yml
 mini-mall-order/src/main/resources/application.yml
 mini-mall-product/src/main/resources/application.yml
 mini-mall-user/src/main/resources/application.yml
+mini-mall-review/src/main/resources/application.yml
 
 # --- 临时文件 ---
 *.tmp

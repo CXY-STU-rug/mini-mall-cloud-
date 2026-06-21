@@ -33,6 +33,8 @@
         <module>mini-mall-gateway</module>
         <!-- ⭐ G3.0 解开：迁购物车/订单/秒杀的载体 -->
         <module>mini-mall-order</module>
+        <!-- ⭐ G7 新增：商品评价服务（单体没做，微服务版独有） -->
+        <module>mini-mall-review</module>
     </modules>
 
     <!-- ═══════════════════════════════════════════════════════════

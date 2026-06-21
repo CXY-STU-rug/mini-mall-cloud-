@@ -37,4 +37,15 @@ public interface IProductService extends IService<Product> {
 
     /** G3.10 回库存(取消/关单时用) */
     int restoreStock(Long productId, Integer quantity);
+
+    /**
+     * G7.7 重算并回写商品评分聚合
+     * <p>
+     * 流程:
+     *   ① 从 reviews 表 SELECT AVG(rating), COUNT(*) WHERE product_id=?
+     *   ② UPDATE product SET avg_rating=?, review_count=? WHERE id=?
+     * <p>
+     * 调用方: review 服务通过 Feign 调用 (评价落库后)
+     */
+    void refreshRating(Long productId);
 }

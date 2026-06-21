@@ -10395,3 +10395,623 @@ DB:
 ---
 
 **G6 完毕**. 微服务从 "下单/付款/取消" 走到 "**完整下单全链路 + 状态机 + 定时任务**". 下一步可选: G7 评价, G8 优惠券, G9 ES 商品搜索, G10 后台管理.
+
+---
+
+# 73. G7 商品评价 (mini-mall-review, 9004)
+
+> 单体 mini-mall 没做评价, 微服务版【独有】. 这是第一次"无单体参考"完全从零写的服务.
+
+## 73.1  G7 目标 & 设计决策
+
+**业务目标**: 用户对【已完成订单】里买过的商品打分 + 写评论, 商品页显示平均分.
+
+**架构决策**:
+
+| 决策点 | 选择 | 原因 |
+|---|---|---|
+| 单独建 review 服务 | ✅ 是 | 评价业务边界清晰, 数据/规则都独立 |
+| 端口 9004 | 9004 | 紧接 9003 order, 顺序好记 |
+| `@GlobalTransactional` Seata | ✗ **不用** | 评价不涉及钱, 最终一致即可, 别上重锤 |
+| RabbitMQ 异步 | ✗ **不用** | 评价是同步操作, 无削峰需求 |
+| Redis | ✗ **不用** (review 侧) | review 主要写, 缓存命中率为 0; product 侧已有 |
+| 评分回写方式 | ✅ Feign 调 product.refreshRating | 简单清晰, product 算 AVG 写 product.avg_rating |
+| 评分聚合存哪 | ✅ product 表加 2 列 (avg_rating/review_count) | 空间换时间, 避免详情页每次实时 AVG/COUNT |
+| product 怎么算 AVG | ✅ product 服务直读 reviews 表 | 共库阶段可行; 长远走事件驱动 |
+
+**端口分配**:
+```
+9000 = (空)              9001 = user          9002 = product
+9003 = order             9004 = review        9080 = gateway
+8848 = Nacos             8091 = Seata
+Sentinel 客户端口:
+  8719=user 8720=product 8721=gateway 8722=order 8723=review
+```
+
+## 73.2  G7.1 SQL DDL (踩坑: 存储过程报错)
+
+新建 `sql/g7-reviews.sql`:
+
+```sql
+-- product 加 2 列 (评分聚合)
+ALTER TABLE `product`
+    ADD COLUMN `avg_rating`   DECIMAL(2,1) NOT NULL DEFAULT 0.0,
+    ADD COLUMN `review_count` INT          NOT NULL DEFAULT 0;
+
+-- reviews 表
+CREATE TABLE IF NOT EXISTS `reviews` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `user_id` BIGINT NOT NULL,
+  `order_id` BIGINT NOT NULL,
+  `product_id` BIGINT NOT NULL,
+  `rating` TINYINT NOT NULL,
+  `content` VARCHAR(500) DEFAULT NULL,
+  `create_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `update_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `is_deleted` TINYINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_order_product` (`order_id`, `product_id`),  -- ★ 兜底防重复评价
+  KEY `idx_product_id` (`product_id`),
+  KEY `idx_user_id` (`user_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品评价表';
+```
+
+### 设计要点
+
+- **DECIMAL(2,1)** 不用 FLOAT: 钱/分数类要精确, FLOAT 有舍入误差
+- **UNIQUE KEY (order_id, product_id)**: 应用层 + 数据库双保险防重复评价
+- **TINYINT rating**: 1-5 星, byte 足够
+
+### 第一版存储过程踩坑
+
+最早写了 `add_column_if_not_exists` 存储过程支持幂等执行, 用双引号包含单引号:
+```sql
+CALL add_column_if_not_exists('product', 'avg_rating', "DECIMAL(2,1) ... '...'");
+```
+报错: `ERROR 1064 (42000) at line 39: You have an error in your SQL syntax`
+- 根因: 双引号 + 内嵌单引号在 MySQL 解析器里语义不明确
+- 修复: 直接 ALTER TABLE, 放弃幂等性, 一次性脚本
+
+## 73.3  G7.2~G7.6 模块骨架 + 业务实现
+
+### 模块结构
+
+```
+mini-mall-review/
+├── pom.xml                    最简依赖, 砍掉 MQ/Seata/Redis
+├── src/main/java/com/minimall/review/
+│   ├── MiniMallReviewApplication.java   @ComponentScan("com.minimall") 才能扫到 common 包
+│   ├── client/
+│   │   ├── OrdersFeignClient.java       调 order 校验订单
+│   │   ├── ProductFeignClient.java      调 product 回写评分
+│   │   └── fallback/                    2 个降级实现
+│   ├── controller/ReviewController.java  3 个端点
+│   ├── dto/CreateReviewDTO.java          @NotNull/@Min/@Max/@Size 校验
+│   ├── entity/Reviews.java               @TableLogic 软删
+│   ├── mapper/ReviewsMapper.java         extends BaseMapper
+│   ├── service/IReviewsService.java
+│   ├── service/impl/ReviewsServiceImpl.java   ★ 核心: 4 步校验 + 落库 + Feign 回写
+│   └── vo/ReviewVO.java                  @JsonFormat 格式化 createTime
+└── src/main/resources/application.yml    9004 端口
+```
+
+### 3 个端点
+
+```
+POST /review                     创建评价 (需登录, @Valid 拦参数)
+GET  /review/product/{productId} 商品评价列表 (公开, 网关白名单)
+GET  /review/user                我的评价 (需登录)
+```
+
+## 73.4  ⭐ 业务规则编排 - 4 步校验链
+
+`ReviewsServiceImpl.createReview` 是 G7 教学核心:
+
+```
+Step 1: Feign 调 order.getOrderDetail → 校验 code != 200 抛业务异常
+Step 2: 校验 order.status == 3 (COMPLETED), 否则"只有已完成订单可评价"
+Step 3: 校验 dto.productId 在 order.items 里, 否则"该商品不在订单里"
+Step 4: 校验 SELECT COUNT(*) FROM reviews 没记录, 否则"已评价过"
+Step 5: INSERT reviews
+Step 6: registerSynchronization afterCommit → Feign 调 product.refreshRating
+```
+
+### 教学要点 - "前置 vs 后置" Feign Fallback 判断
+
+| 场景 | Fallback 返什么 | 原因 |
+|---|---|---|
+| Step 1 前置校验 - order 挂了 | `Result.error(503)` | 校验过不去, 不能让评价继续 |
+| Step 6 后置补偿 - product 挂了 | `Result.success(null)` | 主流程已成, 不能因副作用回滚 |
+
+口诀: **前置校验/关键扣减 → error 拦; 后置补偿/非关键回写 → success log 走**.
+
+## 73.5  ⭐⭐ G7.E2E 踩的最关键的坑 - 跨服务事务可见性
+
+### 症状
+
+第一次端到端测试:
+- 评价 INSERT 成功 (`reviews` 表有 1 条 rating=5)
+- 商品详情查出 `avgRating=0.0, reviewCount=0` ← **没回写**
+- product 日志: `[refreshRating] productId=1 avg=0 count=0 缓存已删` ← **product 查 reviews 时数据为空**
+
+### 根因 (时序图)
+
+```
+[原版有 bug 的代码]                       [问题时序]
+                                          
+@Transactional                            T0  review 事务开始
+public Long createReview(...) {           T1  INSERT reviews (未提交, 在事务里)
+    ...                                   T2  Feign 调 product.refreshRating
+    reviewsMapper.insert(r);              T3  product 新开事务查 reviews
+    productFeignClient                    T4  product 看不到 review 未提交数据
+        .refreshRating(productId);  ←——        AVG(rating)=null, COUNT=0
+    return r.getId();                     T5  product UPDATE avg_rating=0 (错!)
+}                                         T6  review 事务 commit
+                                          T7  reviews 表里【现在】有 1 条
+                                              但 product.avg_rating【已经】被刷成 0 了
+```
+
+### 修复 - TransactionSynchronizationManager.afterCommit
+
+```java
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+// Step 6 改成:
+Long pid = dto.getProductId();
+TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+    @Override
+    public void afterCommit() {
+        productFeignClient.refreshRating(pid);
+    }
+});
+```
+
+修复后时序:
+```
+T0  review 事务开始
+T1  INSERT reviews
+T2  注册 afterCommit 回调 (但不执行)
+T3  review 事务 commit ✓     ← reviews 表里有了
+T4  afterCommit 触发, 调 product.refreshRating
+T5  product 查 reviews 看到新数据
+T6  AVG=5.0 COUNT=1 → UPDATE product.avg_rating=5.0 ✓
+```
+
+### 教训 (面试金句)
+
+**"事务里发外部消息/Feign/邮件" → 永远要 afterCommit**
+
+不只本案. 凡是:
+- 事务里发 MQ → 消费方拿到 ID 去查 DB, 可能查空
+- 事务里发邮件 → 邮件内容引用了未提交的 ID
+- 事务里写 Redis → 业务回滚但 Redis 没回滚
+
+都得 afterCommit. Spring 提供 3 种姿势:
+1. `TransactionSynchronizationManager.registerSynchronization(...)` (本案用法)
+2. `@TransactionalEventListener(phase = AFTER_COMMIT)`
+3. 用 `TransactionTemplate.execute()` 把事务边界缩到 INSERT 那一行
+
+## 73.6  Cache Aside 写策略 (顺手实现)
+
+G7.7 写 `ProductServiceImpl.refreshRating` 时, 顺手实现了 Cache Aside 写:
+
+```java
+public void refreshRating(Long productId) {
+    // 1. 算 AVG + COUNT
+    Map<String, Object> stats = reviewsMapper.selectStats(productId);
+    BigDecimal avg = ...;
+    Integer count = ...;
+    
+    // 2. UPDATE product
+    Product p = new Product();
+    p.setId(productId);
+    p.setAvgRating(avg);
+    p.setReviewCount(count);
+    productMapper.updateById(p);
+    
+    // 3. DEL Redis 缓存 (Cache Aside 写策略)
+    //    为啥是 DEL 不是 SET?
+    //    SET 引入双写一致性: A 写 5 星 B 写 3 星, 缓存可能停留在错的值
+    //    DEL 让下次读重查 DB → 总是最新, 也最简单不容易错
+    redisTemplate.delete("product:detail:" + productId);
+}
+```
+
+下次 GET /product/1 → 缓存未命中 → 查 MySQL (新 avg=5.0) → 回填 Redis. 端到端 5 端口验证全过.
+
+## 73.7  G7 完整端到端验证记录
+
+| 测试 | 期望 | 实际 |
+|---|---|---|
+| 创建评价 (合规) | 成功 + 评分回写 | data=2, product.avg=5.0 ✓ |
+| 查商品评价列表 (公开) | 返列表 | 1 条 5 星 ✓ |
+| 查我的评价 | 返列表 | 1 条 ✓ |
+| 重复评价 | 被拒 | "该商品已评价过, 请勿重复" ✓ |
+| 用 PAID(1) 订单评价 | 被拒 | "只有已完成订单可评价" ✓ |
+| rating=10 超范围 | 400 | "rating 评分最多 5 星" ✓ |
+
+## 73.8  常见踩坑速查
+
+| 坑 | 表现 | 原因 | 修 |
+|---|---|---|---|
+| **跨事务可见性** | refreshRating 把 avg 刷成 0 | T2 Feign 早于 T6 commit | afterCommit 回调 |
+| Java 8 PATH 干扰 | java -jar 启不动 SB3 | which java → Java 8 | 用 D:\jdk-21.0.11\bin\java |
+| Git Bash 中文 JSON | 500 Invalid UTF-8 0xba | GBK→UTF-8 转换错 | 测试用英文 content |
+| 网关白名单 startsWith 匹配 | POST /review 也被白名单放 | "/review/product" 前缀也匹配不到 POST /review | 路径分隔够清晰即可 |
+| product entity 缺字段 | UPDATE 不动 avg_rating | 加了 SQL 列没同步 Java | Product.java 同步加字段 |
+
+## 73.9  N=3 决策回顾 - 为啥还没抽 common-redis
+
+按 `feedback_concrete_first` 严格 N=3 阈值:
+
+| 服务 | 用 Redis? |
+|---|---|
+| order | ✅ (G1.3 RedisConfig) |
+| product | ✅ (G3.5.3 RedisConfig) |
+| review | ❌ 暂无缓存需求 |
+
+**N=2, 暂不抽**. 等 review 真出现"热门商品评价列表"等缓存场景时 (那时 N=3), 再抽 common-redis 才自然.
+
+## 73.10  G7 累计文件
+
+```
+SQL:
+  sql/g7-reviews.sql              新建表 + product 加 2 列
+  sql/schema.sql                  全量 schema 同步加 G6 G7 字段
+
+新增模块:
+  mini-mall-review/               整个新服务 (9004)
+
+修改:
+  父 pom + module 列表加 mini-mall-review
+  mini-mall-gateway/.../application.yml          + review-route
+  mini-mall-gateway/.../AuthGlobalFilter.java    + "/review/product" 白名单
+  mini-mall-product/.../entity/Product.java      + avgRating + reviewCount
+  mini-mall-product/.../service/IProductService.java + impl + refreshRating
+  mini-mall-product/.../mapper/ReviewsMapper.java    新建 (只为 SELECT stats)
+  mini-mall-product/.../controller/ProductController.java + internal/refresh-rating
+```
+
+## 73.11  G7 教学速查 - 4 个零散知识点补全
+
+> 这一节把 G7 涉及但前面章节没专题讲的 4 个 API 一次性钉死, 复习只看这里.
+
+### ① Spring `@Transactional` 边界
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public Long createReview(...) {
+    // ① 方法进入 → Spring AOP 开启事务 (TransactionInterceptor.invoke)
+    
+    reviewsMapper.insert(r);     // ← 此时是【未提交】, 同库其他事务看不到
+    
+    return r.getId();            // ② 方法返回 → commit 触发
+                                  //    抛异常返回 → rollback 触发
+}
+```
+
+**边界 = 方法的进入 + 返回点**. 这就是为啥 G7.5 第一版会出 bug:
+- INSERT 在事务内 = 未提交
+- 同方法里 Feign 调下游 = 仍在事务内
+- 下游查 reviews 表 = 在新事务里查 = 看不到未提交数据
+
+**两类"事务边界"陷阱**:
+1. **自调用失效**: `this.methodA()` 调用同类的 `@Transactional methodB()` → 不走代理 → 事务注解失效
+2. **方法返回前发外部消息**: 就是 G7.5 的坑, 用 afterCommit 修
+
+### ② Bean Validation 全链路 (JSR-380)
+
+```
+[前端 POST /review]
+    {"orderId":11,"productId":1,"rating":10}
+            ↓
+[Spring MVC 反序列化]
+    JSON → CreateReviewDTO 对象
+            ↓
+[@Valid 触发校验] ← Controller 方法签名上写了 @Valid 才会跑
+    @NotNull / @Min(1) / @Max(5) / @Size(max=500)
+            ↓ 失败
+    抛 MethodArgumentNotValidException
+            ↓
+[GlobalExceptionHandler 兜底]
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    解析所有 fieldErrors → 拼 "rating 评分最多 5 星"
+    返 Result.error(400, ...)
+            ↓
+[前端拿到]
+    {"code":400, "message":"rating 评分最多 5 星"}
+```
+
+**3 步开关**:
+- Step 1: DTO 字段上加注解 (`@NotNull` 等)
+- Step 2: Controller 方法签名加 `@Valid` (没这个注解再多 `@NotNull` 也不触发)
+- Step 3: 全局有 `GlobalExceptionHandler` 拦 `MethodArgumentNotValidException`
+
+**踩坑**: 漏第 2 步是新手最常见的"DTO 校验不生效", 自己以为加了 `@NotNull` 就够.
+
+### ③ `LambdaQueryWrapper` 方法引用
+
+```java
+// 老写法 - 字符串列名, 改 entity 字段名编译器抓不到错
+new QueryWrapper<Reviews>().eq("order_id", 123L)
+                            ↑ 写错 "oder_id" 运行时才炸
+
+// 新写法 - lambda 方法引用, 改字段名编译报红
+new LambdaQueryWrapper<Reviews>().eq(Reviews::getOrderId, 123L)
+                                  ↑ Reviews 类没这 getter 直接编译报错
+```
+
+**MP 怎么从 getter 反推列名?**
+- `Reviews::getOrderId` → 反射拿方法名 `getOrderId` → 去掉 `get` → `orderId` 
+- 配 yml 的 `map-underscore-to-camel-case: true` → 转 `order_id`
+
+**常用方法对照 SQL**:
+
+| Wrapper 方法 | 对应 SQL |
+|---|---|
+| `.eq(field, val)` | `field = ?` |
+| `.ne(field, val)` | `field != ?` |
+| `.gt/.lt/.ge/.le(field, val)` | `> < >= <=` |
+| `.like(field, val)` | `LIKE '%?%'` |
+| `.in(field, list)` | `IN (?, ?)` |
+| `.between(field, a, b)` | `BETWEEN ? AND ?` |
+| `.isNull(field)` | `IS NULL` |
+| `.orderByDesc(field)` | `ORDER BY field DESC` |
+| `.groupBy(field)` | `GROUP BY field` |
+| `.last("LIMIT 10")` | 拼裸 SQL 后缀 (慎用) |
+
+链式调用自动 AND 连接, `.or()` 改 OR.
+
+### ④ `BeanUtils.copyProperties` 同名字段拷贝
+
+```java
+private ReviewVO toVO(Reviews r) {
+    ReviewVO vo = new ReviewVO();
+    BeanUtils.copyProperties(r, vo);   // src → target
+    return vo;
+}
+```
+
+**规则**:
+- **同名同类型**字段自动拷过去 (id/userId/orderId/productId/rating/content/createTime)
+- 源没有的字段 (VO 的 `username`) → 目标保持 null
+- 类型不兼容 (`Long` → `String`) → 不拷贝, 不报错 (悄无声息踩坑点!)
+
+**为啥要拷不直接返 Entity?**
+- Entity 是数据库的"投影", 跟前端无关
+- 返 Entity → `isDeleted` 字段会暴露给前端
+- 返 Entity → 数据库改字段 = 前端契约破坏
+
+**坑预警**: 别拷贝**深结构**.
+```java
+class A { List<B> bs; }
+BeanUtils.copyProperties(srcA, tgtA);
+// tgtA.bs 跟 srcA.bs 指向【同一个 List】, 改一个动俩
+```
+真要深拷贝用 `MapStruct` 或手动 `new ArrayList<>(src.getBs())`.
+
+---
+
+**G7 完毕**. 微服务从 "完整下单" 走到 "**带评价闭环 + Cache Aside 写策略 + 跨服务事务可见性踩坑**". 下一步可选: G8 优惠券, G9 ES 商品搜索, G10 后台管理, 或回头补 C1 README + C2 GitHub 改名.
+
+---
+
+# 74. G8 优惠券 (跨服务用券抵扣)
+
+## 74.1  G8 目标 & 设计决策
+
+**业务目标**: 用户领满减券 → 下单选券抵扣 → 取消订单券能退回.
+
+**核心架构决策**:
+
+| 决策点 | 选择 | 原因 |
+|---|---|---|
+| 放哪个服务 | ✅ user 服务 | "我的优惠券"在用户中心自然; N=1 不抽独立 coupon 服务 |
+| 券类型 | ✅ 只满减 (G8) | 折扣留扩展, 教学聚焦 |
+| 用 Seata? | order 已经在用 (G5) | 涉及钱必须强一致 |
+| user 也接 Seata? | ❌ 教学省略 | **代价: useCoupon 不能自动回滚, 留下脏数据可能** |
+| 取消订单退券 | ✅ 退 | 用户体验; 用 afterCommit 套路 (G7 学过) |
+| 数据模型 | coupon(模板) + user_coupon(具体) | UNIQUE KEY(user_id, coupon_id) 防重复领 |
+
+**关键 SQL 设计**:
+- `orders.user_coupon_id` (不是 coupon_id): 退回时直接定位用户那张券
+- `orders.discount_amount`: 抵扣金额【快照】, 防 coupon 模板被改影响历史订单
+- `coupon.remain_stock`: 原子 CAS 扣减防超发
+
+## 74.2  G8 核心业务流
+
+### 领券 (4 步)
+
+```
+Step 1: 校验券模板 (存在 + 上架 + 在有效期)
+Step 2: 校验该用户没领过 (应用层第一道)
+Step 3: ⭐ CAS 扣库存: UPDATE coupon SET remain=remain-1 WHERE remain>0
+Step 4: INSERT user_coupon (DB UNIQUE KEY 兜底)
+```
+
+### 下单用券 (5.5 步插在 createOrder 里)
+
+```
+... [前面 1-5 步算 originalAmount] ...
+
+save(order)  ← 拿到 orderId
+
+if dto.userCouponId != null:
+    Feign userFeignClient.useCoupon(userId, ucId, originalAmount, orderId)
+    ↓ user 服务那边:
+       1. 校验 user_coupon 存在 + status=0
+       2. 越权: user_id 匹配
+       3. 校验在有效期
+       4. orderAmount >= threshold
+       5. ⭐ CAS UPDATE user_coupon SET status=1 WHERE status=0  (乐观锁)
+       返 discountAmount
+    
+    order.setTotalAmount(originalAmount - discount)
+    order.setUserCouponId(ucId)
+    order.setDiscountAmount(discount)
+    updateById(order)
+
+... [后面 6-8 步扣库存/MQ] ...
+```
+
+### 取消订单退券 (用 G7 学的 afterCommit)
+
+```
+@TransactionalExecute / @Transactional 包住:
+    UPDATE orders SET status=4
+    回库存 (Feign 调 product)
+    
+    if order.userCouponId != null:
+        registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                userFeignClient.refundCoupon(ucId);
+            }
+        });
+```
+
+**afterCommit 第二次复用** — 跟 G7 review.refreshRating 同套路, 学一次记一辈子.
+
+## 74.3  ⭐ 教学要点 - 3 处 CAS 思想
+
+G8 写了 3 处 "UPDATE ... WHERE 条件" 实现乐观锁:
+
+| 位置 | SQL | 防什么 |
+|---|---|---|
+| `coupon.deductRemainStock` | `UPDATE coupon SET remain=remain-1 WHERE remain>0` | 超发 (两人同抢最后 1 张) |
+| `user_coupon.useCoupon` | `UPDATE SET status=1 WHERE status=0` | 同张券被两笔订单都用 |
+| (G3.10) `product.deductStock` | `UPDATE SET stock=stock-? WHERE stock>=?` | 库存超卖 |
+
+口诀: **"高并发安全 = WHERE 加状态条件 + 看 rows==1"**.
+
+## 74.4  ⭐⭐ 教学限制 - user 没接 Seata 的脏数据风险
+
+### 风险场景
+
+```
+T0  order: save 订单 (Seata XID 分支事务)
+T1  order: Feign useCoupon → user 服务 UPDATE user_coupon (本地事务, commit ✓)
+T2  order: 第 7 步扣库存失败 (product 没货)
+T3  @GlobalTransactional 回滚:
+      - order 库的 INSERT 通过 undo_log 撤回 ✓
+      - product 库已扣的 stock 通过 undo_log 撤回 ✓
+      - ❌ user 库的 user_coupon UPDATE 【不在 Seata 管辖】, 不回滚
+T4  最终: 订单不存在了, 但用户的券【已被错扣】
+```
+
+### 解法
+
+1. **生产解法**: user 服务也接 Seata Server, 上 undo_log 表 + Seata 依赖. 让 useCoupon 自动加入分支事务.
+2. **教学接受**: 当前 user 没接, 留个 "已知脏数据风险" 监控告警. 真出现时用后台 job 比对 user_coupon vs orders 关联做修复.
+
+### 关键认知
+
+跨服务事务【一致性】不是 "用了 Feign 就有", 是 "**所有参与方都接同一套 TC**" 才有.
+G5 时 order + product 接了, G8 没把 user 拉进来 = 这条链路不强一致, 是个 trade-off, 不是 bug.
+
+## 74.5  G8 端到端验证记录 (7 项全过)
+
+| 测试 | 期望 | 实际 |
+|---|---|---|
+| 列可领券 (公开) | 2 张 | ✅ |
+| 领券 → DB | user_coupon 新行 + remain 100→99 | ✅ |
+| 我的券 + expired 标志 | 显示模板信息 + 是否过期 | ✅ |
+| ⭐ 下单抵扣 | 5999 → 5989 (减 10), status=1 | ✅ |
+| ⭐ 取消订单退券 | status 1→0, order_id NULL | ✅ |
+| 回库存 | product.stock 还原 | ✅ |
+| 重复领券拦截 | "您已领取过该券" | ✅ |
+
+## 74.6  G8 踩的小坑速查
+
+| 坑 | 表现 | 原因 | 修 |
+|---|---|---|---|
+| Windows mysql cli 中文 INSERT | `ERROR 1366 Incorrect string value '\xA1100'` | mysql cli 默认 GBK | 加 `--default-character-set=utf8mb4` + `SET NAMES utf8mb4` |
+| 网关 404 找不到 /coupon/** | 加了路由还是 404 | gateway 没重启 jar | 改 yml = 必须 jar 重打+重启 (yml 打进 jar) |
+| Git Bash 中文 JSON body | `Invalid UTF-8 0xba` | curl 命令行 GBK→UTF-8 转换错 | 测试用英文 content |
+| 列名编译期对不上 | 编译过运行 Where 不命中 | 用 QueryWrapper 字符串 | 改 LambdaQueryWrapper + 方法引用 |
+
+## 74.7  G8 教学速查 - 新出现的 4 个 API
+
+### ① `@Update` + `#{}` 原子 SQL
+
+```java
+@Update("UPDATE coupon SET remain_stock=remain_stock-1 WHERE id=#{id} AND remain_stock>0")
+int deductRemainStock(@Param("id") Long id);
+```
+返 `int` = 受影响行数, 0 表示失败.
+
+**口诀**: 写 SQL 用 `#{}` 不用 `${}` ($是字符串拼接, SQL 注入风险).
+
+### ② `LambdaUpdateWrapper` CAS 写法
+
+```java
+mapper.update(null, new LambdaUpdateWrapper<UserCoupon>()
+    .eq(UserCoupon::getId, id)
+    .eq(UserCoupon::getStatus, 0)        // ⭐ WHERE 加状态条件
+    .set(UserCoupon::getStatus, 1));
+```
+对应 SQL `UPDATE ... SET status=1 WHERE id=? AND status=0`. 并发安全.
+
+### ③ N+1 查询 vs `selectBatchIds`
+
+```java
+// ❌ 错: 用户有 N 张券就 N 次 SELECT
+ucs.forEach(uc -> couponMapper.selectById(uc.getCouponId()));
+
+// ✅ 对: 1 次 IN 查询
+List<Long> ids = ucs.stream().map(UserCoupon::getCouponId).distinct().toList();
+Map<Long, Coupon> map = couponMapper.selectBatchIds(ids).stream()
+    .collect(Collectors.toMap(Coupon::getId, c -> c));
+```
+
+### ④ afterCommit 套路 - 第 2 次复用
+
+跟 G7 review.refreshRating 完全一样的写法:
+```java
+TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+    @Override public void afterCommit() {
+        userFeignClient.refundCoupon(ucId);
+    }
+});
+```
+
+**用 G7 的笔记 73.5 完整理论**, G8 只是套用.
+
+## 74.8  G8 累计文件
+
+```
+SQL:
+  sql/g8-coupons.sql          (新建: orders 加 2 列 + coupon/user_coupon 新表 + 2 张测试券)
+  sql/schema.sql              (同步全量)
+
+user 服务新增:
+  entity/Coupon.java
+  entity/UserCoupon.java
+  mapper/CouponMapper.java         (+2 原子 SQL deduct/restoreRemainStock)
+  mapper/UserCouponMapper.java
+  service/ICouponService.java
+  service/impl/CouponServiceImpl.java   (~250 行核心)
+  controller/CouponController.java      (6 端点)
+  dto/UseCouponDTO.java
+  vo/UserCouponVO.java
+
+order 服务改:
+  entity/Orders.java          (+userCouponId +discountAmount)
+  dto/CreateOrderDTO.java     (+userCouponId)
+  dto/UseCouponDTO.java       (新建, 跟 user 那边字段对齐)
+  client/UserFeignClient.java (+useCoupon/refundCoupon)
+  client/fallback/UserFeignClientFallback.java  (+2 fallback)
+  service/impl/OrdersServiceImpl.java
+    createOrder       (插入 5.5 步用券逻辑)
+    cancelOrder       (afterCommit refundCoupon)
+    closeOrderByMQ    (afterCommit refundCoupon)
+
+网关:
+  application.yml          (+coupon-route)
+  AuthGlobalFilter.java    (+"/coupon/available" 白名单)
+```
+
+---
+
+**G8 完毕**. 微服务从 "评价闭环" 走到 "**完整电商核心: 用户/商品/订单/库存/物流/评价/优惠券 + 跨服务事务 + CAS 乐观锁**". 后续可选: G9 ES 商品搜索, G10 后台管理, 或 C1 README + C2 GitHub 改名收尾.

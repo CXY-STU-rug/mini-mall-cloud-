@@ -24,4 +24,7 @@ public class CreateOrderDTO {
 
     /** 备注 (可选) */
     private String remark;
+
+    /** G8: 用哪张券 (user_coupon.id, 可空 - 不用券就 null) */
+    private Long userCouponId;
 }

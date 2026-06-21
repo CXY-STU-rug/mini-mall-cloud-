@@ -103,6 +103,13 @@ public class ProductController {
         return Result.success(productService.restoreStock(id, qty));
     }
 
+    /** ⑨ G7.7 重算评分 (内部端点, 给 review 服务 Feign 调) */
+    @PutMapping("/{id}/internal/refresh-rating")
+    public Result<Void> refreshRating(@PathVariable Long id) {
+        productService.refreshRating(id);
+        return Result.success(null);
+    }
+
     // ════════════════════════════════════════════════════════════════
     // F2.6 Sentinel 熔断演示(保留)
     // ════════════════════════════════════════════════════════════════

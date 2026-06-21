@@ -1,11 +1,15 @@
 package com.minimall.order.client;
 
 import com.minimall.common.core.domain.Result;
+import com.minimall.order.dto.UseCouponDTO;
 import org.springframework.cloud.openfeign.FeignClient;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 
+import java.math.BigDecimal;
 import java.util.Map;
 
 /**
@@ -46,4 +50,18 @@ public interface UserFeignClient {
             @PathVariable("id") Long id,
             @RequestHeader("X-User-Id") Long userId
     );
+
+    /**
+     * G8: 用券 (下单时调)
+     * 成功返【实际抵扣金额】, 失败 (券不属于该用户/已用/过期/未达门槛) 抛 BusinessException
+     */
+    @PutMapping("/coupon/internal/use")
+    Result<BigDecimal> useCoupon(@RequestBody UseCouponDTO dto);
+
+    /**
+     * G8: 退券 (取消订单/关单时调)
+     * 设计为幂等, 多次调用结果一致, 找不到券 / 已是未用都返 success.
+     */
+    @PutMapping("/coupon/internal/refund/{ucId}")
+    Result<Void> refundCoupon(@PathVariable("ucId") Long ucId);
 }

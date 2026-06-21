@@ -11,6 +11,7 @@ import com.minimall.order.config.RabbitMQConfig;
 import com.minimall.order.constant.OrderStatus;
 import com.minimall.order.dto.CreateOrderDTO;
 import com.minimall.order.dto.ShipOrderDTO;
+import com.minimall.order.dto.UseCouponDTO;
 import com.minimall.order.entity.CartItem;
 import com.minimall.order.entity.OrderItem;
 import com.minimall.order.entity.Orders;
@@ -29,6 +30,8 @@ import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
@@ -182,12 +185,16 @@ public class OrdersServiceImpl extends ServiceImpl<OrdersMapper, Orders> impleme
                 String orderNo = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"))
                         + userId + String.format("%04d", new Random().nextInt(10000));
 
+                // ⭐ G8: 此刻 totalAmount 是【原始金额】, 还没扣券
+                BigDecimal originalAmount = totalAmount;
+
                 // 构造 Orders 主表 (地址快照: 拼省+市+区+详细)
                 Orders order = new Orders();
                 order.setOrderNo(orderNo);
                 order.setUserId(userId);
-                order.setTotalAmount(totalAmount);
-                order.setStatus(OrderStatus.UNPAID);   // 0 = 待付款
+                order.setTotalAmount(originalAmount);     // 先按原价存, 后面用券再 update
+                order.setDiscountAmount(BigDecimal.ZERO); // 默认 0, 用券后改
+                order.setStatus(OrderStatus.UNPAID);
                 order.setReceiver((String) address.get("receiver"));
                 order.setPhone((String) address.get("phone"));
                 order.setAddress("" + address.get("province") + address.get("city")
@@ -195,6 +202,38 @@ public class OrdersServiceImpl extends ServiceImpl<OrdersMapper, Orders> impleme
                 order.setRemark(dto.getRemark());
 
                 this.save(order);   // ⭐ MP 自动回填 id 到 order.id
+
+                // ─── 第 5.5 步: G8 用券 (可选) ──────────
+                // 时序设计:
+                //   先 save 订单拿 id, 再调 Feign 用券 (需要 orderId 参数)
+                //   useCoupon 抛业务异常 → @GlobalTransactional 回滚 order 库 INSERT
+                //   ⚠ 教学限制: user 服务【没接 Seata】, 万一这里成功但下面扣库存失败,
+                //     user 库的 user_coupon 状态变更【不会自动回滚】 (留下脏数据)
+                //     生产应让 user 服务也接 Seata, 或用 MQ 异步补偿
+                if (dto.getUserCouponId() != null) {
+                    UseCouponDTO useDto = new UseCouponDTO();
+                    useDto.setUserId(userId);
+                    useDto.setUserCouponId(dto.getUserCouponId());
+                    useDto.setOrderAmount(originalAmount);
+                    useDto.setOrderId(order.getId());
+
+                    Result<BigDecimal> useResp = userFeignClient.useCoupon(useDto);
+                    if (useResp == null || useResp.getCode() != 200) {
+                        throw new BusinessException(useResp == null ? 503 : useResp.getCode(),
+                                useResp == null ? "用券失败" : useResp.getMessage());
+                    }
+                    BigDecimal discountAmount = useResp.getData();
+                    BigDecimal finalAmount = originalAmount.subtract(discountAmount);
+                    // 防御: 抵扣不能超过原价 (理论上不会, 但保险)
+                    if (finalAmount.compareTo(BigDecimal.ZERO) < 0) {
+                        finalAmount = BigDecimal.ZERO;
+                    }
+                    // 回写订单: 实际应付 + 抵扣金额 + 用了哪张券
+                    order.setUserCouponId(dto.getUserCouponId());
+                    order.setDiscountAmount(discountAmount);
+                    order.setTotalAmount(finalAmount);
+                    this.updateById(order);
+                }
 
                 // ─── 第 6 步: 批量保存 OrderItem (orderId 现在才有) ─
                 for (OrderItem oi : orderItems) {
@@ -397,6 +436,20 @@ public class OrdersServiceImpl extends ServiceImpl<OrdersMapper, Orders> impleme
                 for (OrderItem item : items) {
                     productFeignClient.restoreStock(item.getProductId(), item.getQuantity());
                 }
+
+                // ── G8 退券: 用了券就 afterCommit 调 user.refundCoupon ──
+                //   afterCommit 原因 (跟 G7 review 同坑):
+                //   user 端如果立刻查 orders 表确认状态, 此时 UPDATE 还没 commit, 看不到 CANCELLED.
+                //   afterCommit 时机最干净
+                Long ucId = order.getUserCouponId();
+                if (ucId != null) {
+                    TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            userFeignClient.refundCoupon(ucId);
+                        }
+                    });
+                }
                 return null;
             });
         } finally {
@@ -464,6 +517,17 @@ public class OrdersServiceImpl extends ServiceImpl<OrdersMapper, Orders> impleme
         List<OrderItem> items = orderItemMapper.selectList(itemW);
         for (OrderItem item : items) {
             productFeignClient.restoreStock(item.getProductId(), item.getQuantity());
+        }
+
+        // ── G8 退券: afterCommit 调 user.refundCoupon ──
+        Long ucId = order.getUserCouponId();
+        if (ucId != null) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    userFeignClient.refundCoupon(ucId);
+                }
+            });
         }
     }
 

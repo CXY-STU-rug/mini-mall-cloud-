@@ -1,0 +1,47 @@
+# ═════════════════════════════════════════════════════════════════
+# mini-mall-review 评价服务配置 (示例 / 模板)
+# 用法: cp application.yml.example application.yml , 然后填自己的密码
+# ═════════════════════════════════════════════════════════════════
+
+server:
+  port: 9004                        # ⭐ review 服务对外端口
+
+spring:
+  application:
+    name: mini-mall-review
+
+  # ─── MySQL 数据源 ────────────────────────────────────────────
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/mini_mall?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: root
+    password: <你的MySQL密码>
+
+  cloud:
+    # ─── Nacos 服务发现 ────────────────────────────────────────
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+    # ─── Sentinel 限流熔断 ─────────────────────────────────────
+    sentinel:
+      transport:
+        dashboard: 127.0.0.1:8858
+        port: 8723                  # 跟 user/product/gateway/order 错开
+      eager: true
+
+# ─── Feign 接入 Sentinel, 让 fallback 真生效 ─────────────────────
+feign:
+  sentinel:
+    enabled: true
+
+# ─── MyBatis-Plus 全局配置 ──────────────────────────────────────
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    map-underscore-to-camel-case: true
+
+logging:
+  level:
+    com.minimall: debug
+    root: info

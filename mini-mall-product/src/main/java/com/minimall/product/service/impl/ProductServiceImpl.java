@@ -145,4 +145,48 @@ public class ProductServiceImpl
         }
         return result;
     }
+
+    /**
+     * G7.7 重算并回写商品评分聚合 (G7 重构: 改用 Feign 调 review 服务)
+     *
+     * Cache Aside 写流程:
+     *   ① ★ Feign 调 review.getStats → 拿 (avgRating, reviewCount)
+     *      (重构前: 自己 mapper 直查 reviews 表 - 违反"一服务一表")
+     *   ② UPDATE product SET avg_rating=?, review_count=?
+     *   ③ DEL product:detail:{id}
+     */
+    @Autowired
+    private com.minimall.product.client.ReviewFeignClient reviewFeignClient;
+
+    @Override
+    public void refreshRating(Long productId) {
+        // ─── Step 1: Feign 调 review 拿评分聚合 ────
+        com.minimall.common.core.domain.Result<com.minimall.product.vo.ReviewStatsVO> resp =
+                reviewFeignClient.getStats(productId);
+
+        // 降级保护: review 挂了 fallback 返 null, 跳过本次刷新避免把已有评分清 0
+        if (resp == null || resp.getCode() != 200 || resp.getData() == null) {
+            log.warn("[refreshRating] 取评分聚合失败, 跳过 productId={}", productId);
+            return;
+        }
+        com.minimall.product.vo.ReviewStatsVO stats = resp.getData();
+
+        BigDecimal avgRating = stats.getAvgRating() == null
+                ? BigDecimal.ZERO
+                : stats.getAvgRating().setScale(1, BigDecimal.ROUND_HALF_UP);  // DECIMAL(2,1)
+        Integer reviewCount  = stats.getReviewCount() == null ? 0 : stats.getReviewCount();
+
+        // ─── Step 2: UPDATE product ──────────────
+        Product p = new Product();
+        p.setId(productId);
+        p.setAvgRating(avgRating);
+        p.setReviewCount(reviewCount);
+        productMapper.updateById(p);
+
+        // ─── Step 3: DEL 缓存 (Cache Aside 写策略) ──
+        String cacheKey = "product:detail:" + productId;
+        redisTemplate.delete(cacheKey);
+
+        log.info("[refreshRating] productId={} avg={} count={} 缓存已删", productId, avgRating, reviewCount);
+    }
 }

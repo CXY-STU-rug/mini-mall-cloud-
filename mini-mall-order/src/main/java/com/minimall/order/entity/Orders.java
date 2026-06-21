@@ -76,6 +76,14 @@ public class Orders implements Serializable {
     private String logisticsCompany;
     // ─────────────────────────────────────────────────────────
 
+    // ─── G8 优惠券字段 ───────────────────────────────────────
+    /** 用户使用的具体券 id (关联 user_coupon.id, 不是 coupon 模板) */
+    private Long userCouponId;
+
+    /** 实际抵扣金额 快照 (取消订单时按这个值回退给券) */
+    private BigDecimal discountAmount;
+    // ─────────────────────────────────────────────────────────
+
     /** 备注 (用户填的下单备注) */
     private String remark;
 

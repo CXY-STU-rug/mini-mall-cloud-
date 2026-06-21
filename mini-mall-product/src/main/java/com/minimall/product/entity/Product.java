@@ -45,6 +45,10 @@ public class Product implements Serializable {
     /** 销量（冗余字段） */
     private Integer sales;
 
+    /** G7 评分聚合字段（review 服务回写, 避免实时 AVG/COUNT 拖慢商品详情） */
+    private BigDecimal avgRating;     // 平均评分 0.0~5.0
+    private Integer reviewCount;      // 评价总数
+
     /** 封面图 URL */
     private String coverImage;
 

@@ -51,7 +51,11 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
             // G3.1: 商品分类对游客也可见 (列表/详情)
             // 注: startsWith 会把 POST/PUT/DELETE 也放过, 教学项目暂不区分
             //     生产环境应该用 method + path 双维度白名单
-            "/category"
+            "/category",
+            // ⭐ G7 新增: 游客可看商品评价列表 (POST /review 写评价不受影响, 因为路径不同前缀)
+            "/review/product",
+            // ⭐ G8 新增: 游客可看当前可领的券 (领券/我的券/internal 因路径前缀不同仍需 token)
+            "/coupon/available"
     );
 
     @Override
