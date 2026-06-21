@@ -8648,3 +8648,826 @@ T+30s    POST /seckill/3, alice (重复)     → 400 您已参与过此次秒杀
 **G3.8 完毕**. 微服务从"业务覆盖大半 + MQ 真业务" 走到 "**Lua 原子操作 + MQ 异步下单 + 3 态轮询 全栈接通**".
 G 阶段所有业务模块搬迁完毕: User / Address / Product / Category / Favorite / CartItem / Orders / Seckill 全部就位.
 下一步可以: ① commit + push 留里程碑, ② G4 引分布式事务 (Seata/TCC) 补扣库存功能, ③ 压测验证.
+
+---
+
+# 62. G3.9 — 补 Product 模块缺失的 5 个方法
+
+## 62.1  背景: 全面 diff 发现的洞
+
+G 阶段搬完后做了一次单体 vs 微服务**最严谨的全面对比**, 发现 Product 服务**只搬了壳**:
+
+| 单体 IProductService | 微服务 IProductService |
+|---|---|
+| 5 个业务方法 (getProductDetail / updateProduct / deleteProduct / searchProducts / getHotSearch) | **0 个** (空接口) |
+
+| 单体 ProductController | 微服务 ProductController |
+|---|---|
+| 6 端点 (分页搜+详情+POST/PUT/DELETE+热搜) | 3 端点 (getById + list 前 10 条 + flaky) |
+
+**意味着**: 当前微服务版用户**根本搜不了商品**, 只能 `getById(123)` 一个个看. 这是核心电商功能的断点.
+
+## 62.2  搬的 5 个方法逐个解释
+
+### ① getProductDetail (详情, 带 Redis 缓存)
+
+```java
+@Override
+public Product getProductDetail(Long id) {
+    String key = "product:detail:" + id;
+
+    // 1) 先查 Redis
+    Object cached = redisTemplate.opsForValue().get(key);
+    if (cached != null) {
+        log.info("缓存命中 key={}", key);
+        return (Product) cached;
+    }
+
+    // 2) 没中查 MySQL
+    Product product = productMapper.selectById(id);
+    if (product == null) return null;
+
+    // 3) 回写 Redis, 10 分钟过期
+    redisTemplate.opsForValue().set(key, product, 10, TimeUnit.MINUTES);
+    return product;
+}
+```
+
+**核心模式**: **Cache-Aside Pattern** (旁路缓存)
+- 读: 先 Cache, 没中查 DB, 回写 Cache
+- 写: 改 DB, 删 Cache (下次读自动回填新值)
+
+为啥不"改 DB + 改 Cache"? 因为并发改时 Cache 跟 DB 顺序难保证. **改 DB + 删 Cache** 是行业标准.
+
+### ② updateProduct (改 + 删缓存)
+
+```java
+@Override
+public boolean updateProduct(Product product) {
+    boolean ok = updateById(product);                                   // 改 MySQL
+    if (ok) {
+        redisTemplate.delete("product:detail:" + product.getId());      // 删缓存
+    }
+    return ok;
+}
+```
+
+下次有人来查这个商品, getProductDetail 走未命中分支, 重查 DB 看到新值再回写缓存. **缓存最终一致**.
+
+### ③ searchProducts (核心搜索 + 顺手记录热搜)
+
+```java
+public IPage<Product> searchProducts(Integer page, Integer size,
+                                     Long categoryId, String keyword,
+                                     BigDecimal minPrice, BigDecimal maxPrice) {
+    Page<Product> pageObj = new Page<>(page, size);             // MP 分页对象
+
+    QueryWrapper<Product> w = new QueryWrapper<>();             // 动态条件
+    if (categoryId != null) w.eq("category_id", categoryId);
+    if (StringUtils.hasText(keyword)) {
+        w.like("name", keyword);
+
+        // ⭐ 顺手把搜索词扔进 Redis ZSet 当热搜
+        redisTemplate.opsForZSet().incrementScore("hot:search", keyword, 1);
+        redisTemplate.expire("hot:search", 24, TimeUnit.HOURS);
+    }
+    if (minPrice != null) w.ge("price", minPrice);
+    if (maxPrice != null) w.le("price", maxPrice);
+    w.orderByDesc("create_time");
+
+    return this.page(pageObj, w);                               // MP 自动分页 SQL
+}
+```
+
+**关键知识点**:
+
+1. **MP 分页插件** —— 父 pom 加 `mybatis-plus-jsqlparser` (3.5.9+ 的坑, 见 62.4), Config 类注册 `PaginationInnerInterceptor`, 一行 `this.page(pageObj, w)` 自动改写 SQL 加 LIMIT + 跑 COUNT
+2. **Redis ZSet 当热搜** —— `ZINCRBY` 原子自增分数, 后续 `ZREVRANGE 0 N-1` 拿排行
+3. **24h TTL** —— 防止历史关键词永远占榜
+4. **动态条件** —— null 不加 WHERE, 调用方可灵活组合筛选
+
+### ④ getHotSearch (取 ZSet Top N)
+
+```java
+public List<Map<String, Object>> getHotSearch(int topN) {
+    Set<ZSetOperations.TypedTuple<Object>> tuples =
+            redisTemplate.opsForZSet().reverseRangeWithScores("hot:search", 0, topN - 1);
+
+    List<Map<String, Object>> result = new ArrayList<>();
+    if (tuples != null) {
+        for (ZSetOperations.TypedTuple<Object> t : tuples) {
+            Map<String, Object> item = new HashMap<>();
+            item.put("keyword", t.getValue());
+            item.put("count", t.getScore());
+            result.add(item);
+        }
+    }
+    return result;
+}
+```
+
+`reverseRangeWithScores(key, 0, N-1)` = "倒序拿前 N 个 + 它们的分数", 这是 ZSet 排行榜的标准用法.
+
+## 62.3  MybatisPlusConfig (分页插件)
+
+```java
+@Configuration
+public class MybatisPlusConfig {
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+        interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.MYSQL));
+        return interceptor;
+    }
+}
+```
+
+**没这个 Bean**: `ServiceImpl.page()` 不走分页 SQL, 返全量数据然后自己截.
+**有这个 Bean**: 自动改写 SQL 加 LIMIT, 多跑一条 count SQL 拿 total.
+
+## 62.4  G3.9 大坑: MP 3.5.9 把分页插件拆包了
+
+直接 import 编译报"找不到符号"`PaginationInnerInterceptor`. 排查发现 .m2 仓库里 `mybatis-plus-extension-3.5.9.jar` 真的没这个类 (3.5.7 还在).
+
+**原因**: MP 3.5.9+ 把 `PaginationInnerInterceptor` 拆到了 **独立包 `mybatis-plus-jsqlparser`** (因为这个拦截器依赖 jsqlparser 解析 SQL, 体积大).
+
+**解法**: 父 pom + product pom 都加这个独立依赖
+
+```xml
+<dependency>
+    <groupId>com.baomidou</groupId>
+    <artifactId>mybatis-plus-jsqlparser</artifactId>
+    <version>${mybatis-plus.version}</version>
+</dependency>
+```
+
+## 62.5  G3.9 第二个大坑: Jackson 默认不会序列化 LocalDateTime
+
+Product entity 的 `createTime` 是 `java.time.LocalDateTime`. 首次 getProductDetail 触发"写 Redis" 时炸:
+
+```
+SerializationException: Java 8 date/time type `java.time.LocalDateTime` not supported by default:
+add Module "com.fasterxml.jackson.datatype:jackson-datatype-jsr310" to enable handling
+```
+
+**原因**: `GenericJackson2JsonRedisSerializer` 用的 ObjectMapper 没注册 `JavaTimeModule`, Jackson 默认不认 LocalDateTime / Instant / ZonedDateTime 等 JDK 8 时间类型.
+
+**解法**: RedisConfig 自定义 ObjectMapper 注册模块
+
+```java
+ObjectMapper om = new ObjectMapper();
+om.registerModule(new JavaTimeModule());          // ⭐ 关键: 注册 JDK 8 时间模块
+om.setVisibility(PropertyAccessor.ALL, JsonAutoDetect.Visibility.ANY);
+om.activateDefaultTyping(LaissezFaireSubTypeValidator.instance,
+        ObjectMapper.DefaultTyping.NON_FINAL);    // 反序列化要带 @class
+GenericJackson2JsonRedisSerializer jsonSer = new GenericJackson2JsonRedisSerializer(om);
+```
+
+## 62.6  G3.9 累计能力
+
+| 维度 | 状态 |
+|---|---|
+| 商品搜索 (分页 + 多条件) | ✅ |
+| 商品详情 (Redis 缓存 + 10 分钟 TTL) | ✅ |
+| 商品 CRUD (新建 / 改 / 删) | ✅ |
+| 热搜 (Redis ZSet 24h 排行) | ✅ |
+| 改商品自动失效缓存 | ✅ |
+| MP 分页插件 | ✅ |
+| LocalDateTime Redis 序列化 | ✅ |
+
+---
+
+# 63. G3.10 — 补扣库存断点 (业务真闭环)
+
+## 63.1  背景: G3.7 留的债
+
+读 G3.7 搬过来的 OrdersServiceImpl, 类注释明写:
+
+```java
+// ④ productMapper.deductStock / restoreStock 全部去掉
+//    = 简化版【不扣库存】, 后续 G4 上分布式事务再补
+```
+
+**实际状态**: 用户下 100 单也不扣 1 件库存. 业务有断点.
+
+但 product 表的 stock 字段还在, ProductMapper 的 deductStock/restoreStock SQL 也搬过来了, **缺的只是 order 跨服务的调用**.
+
+## 63.2  方案: order 通过 Feign 调 product 扣库存
+
+```
+┌─ order 服务 ─────────────┐    ┌─ product 服务 ──────────┐
+│ OrdersServiceImpl       │    │ ProductController       │
+│   createOrder()         │    │   deductStock(id, qty)  │
+│     ...                 │    │     │                   │
+│     productFeignClient ─┼────┼─►  │ productService     │
+│       .deductStock()    │    │     .deductStock(id,qty)│
+│     ...                 │    │       │                 │
+│                         │    │       └─ productMapper  │
+│                         │    │           .deductStock  │
+│                         │    │           (原子 SQL)    │
+└─────────────────────────┘    └─────────────────────────┘
+```
+
+## 63.3  product 服务暴露 2 个内部端点
+
+```java
+/** 扣库存 (内部端点, 给 order 服务 Feign 调) */
+@PutMapping("/{id}/stock/deduct")
+public Result<Integer> deductStock(@PathVariable Long id, @RequestParam Integer qty) {
+    int rows = productService.deductStock(id, qty);
+    if (rows == 0) {
+        throw new BusinessException(400, "库存不足");
+    }
+    return Result.success(rows);
+}
+
+/** 回库存 (cancel/close 时调) */
+@PutMapping("/{id}/stock/restore")
+public Result<Integer> restoreStock(@PathVariable Long id, @RequestParam Integer qty) {
+    return Result.success(productService.restoreStock(id, qty));
+}
+```
+
+ProductServiceImpl 转发给原子 SQL:
+
+```java
+@Override
+public int deductStock(Long productId, Integer quantity) {
+    int rows = productMapper.deductStock(productId, quantity);
+    if (rows > 0) {
+        redisTemplate.delete("product:detail:" + productId);  // ⭐ 失效缓存
+    }
+    return rows;
+}
+```
+
+**注意**: 扣完库存**主动删缓存**, 防止下次详情接口返回旧的 stock 值.
+
+## 63.4  ProductFeignClient 加 2 方法
+
+```java
+@FeignClient(name = "mini-mall-product", fallback = ProductFeignClientFallback.class)
+public interface ProductFeignClient {
+
+    @GetMapping("/product/{id}")
+    Result<Map<String, Object>> getById(@PathVariable("id") Long id);
+
+    /** G3.10 扣库存 */
+    @PutMapping("/product/{id}/stock/deduct")
+    Result<Integer> deductStock(@PathVariable("id") Long id, @RequestParam("qty") Integer qty);
+
+    /** G3.10 回库存 */
+    @PutMapping("/product/{id}/stock/restore")
+    Result<Integer> restoreStock(@PathVariable("id") Long id, @RequestParam("qty") Integer qty);
+}
+```
+
+**关键**: Feign 方法签名要跟对方 Controller 完全一致 (HTTP 方法 / 路径 / 注解), Spring Cloud 看注解编织 HTTP 请求.
+
+## 63.5  createOrder 加扣库存循环
+
+```java
+// 第 7 步: 扣库存
+for (CartItem ci : cartItems) {
+    try {
+        Result<Integer> deductResp = productFeignClient.deductStock(ci.getProductId(), ci.getQuantity());
+        if (deductResp == null || deductResp.getCode() != 200) {
+            Map<String, Object> p = productMap.get(ci.getProductId());
+            throw new BusinessException(400, "库存不足: " + p.get("name"));
+        }
+    } catch (BusinessException e) {
+        throw e;
+    } catch (Exception feignEx) {
+        Map<String, Object> p = productMap.get(ci.getProductId());
+        throw new BusinessException(400, "库存不足: " + p.get("name"));
+    }
+}
+```
+
+抛 BusinessException → `transactionTemplate.execute` 自动回滚 **order 库的事务** (orders + order_item 不入库).
+
+⚠ **但 product 已扣的库存不会自动回滚** —— 这就是后面 G5 Seata 要解的问题.
+
+## 63.6  cancelOrder + closeOrderByMQ 加回库存
+
+```java
+order.setStatus(OrderStatus.CANCELLED);
+ordersMapper.updateById(order);
+
+// G3.10 回库存
+QueryWrapper<OrderItem> itemW = new QueryWrapper<>();
+itemW.eq("order_id", orderId);
+List<OrderItem> items = orderItemMapper.selectList(itemW);
+for (OrderItem item : items) {
+    productFeignClient.restoreStock(item.getProductId(), item.getQuantity());
+}
+```
+
+**为啥要查 order_item 再循环还**: 一个订单可能有多个商品, 每个都要还.
+
+**为啥 cancel 不抛事务**: cancel 本身是补救动作, 即使回库存失败也不能让"订单状态停在 CANCELLED 之外". H1 的 Fallback 设计就是基于这个考虑.
+
+## 63.7  原子扣库存 SQL 的一致性
+
+```sql
+UPDATE product 
+SET stock = stock - #{quantity}, sales = sales + #{quantity} 
+WHERE id = #{productId} AND stock >= #{quantity}
+```
+
+**为啥这条 SQL 防超卖**:
+1. **InnoDB 行级锁** —— 单条 UPDATE 自动给目标行加 X 锁, 其他并发请求排队
+2. **WHERE 守卫** —— 库存不够 WHERE 不命中, 影响行数 = 0
+3. **Java 层判断** —— `rows == 0` 抛"库存不足"
+
+并发 1000 个请求抢最后 1 件, **零超卖**.
+
+## 63.8  G3.10 累计能力
+
+| 维度 | 状态 |
+|---|---|
+| 下单真扣库存 | ✅ |
+| 取消订单 / 自动关单 回库存 | ✅ |
+| 库存不足拒绝下单 | ✅ |
+| 单 product 内部强一致 | ✅ (SQL 守卫) |
+| 跨服务事务一致性 | ❌ (留 G5 Seata 解) |
+
+---
+
+# 64. H1 — Feign Fallback 服务降级
+
+## 64.1  问题: 下游挂了, 上游裸抛 5xx
+
+H1 之前的链路:
+
+```
+product 挂了
+   ↓
+order createOrder → productFeignClient.deductStock(...)
+   ↓
+Feign 连不上 → 抛 RetryableException / FeignException
+   ↓
+@Transactional 接住 → 异常一路冒到 Controller
+   ↓
+GlobalExceptionHandler 兜底 → 500 "系统繁忙"
+   ↓
+用户体验: 不明所以的 500
+```
+
+**简历级别项目不能这样**, 要有友好降级.
+
+## 64.2  Feign Fallback 是什么
+
+为 @FeignClient 接口注册一个**实现类**, 当 Feign 调用失败时, **Spring 自动回退到这个实现类**返兜底响应:
+
+```
+正常: order → Feign 代理 → HTTP 请求 → product 返 200 → 拿到数据
+降级: order → Feign 代理 → 调用失败 → 调 Fallback Bean → 返兜底 Result
+                                       ↑
+                                  Sentinel 接管
+```
+
+## 64.3  3 个 Fallback 类全部代码
+
+### order/ProductFeignClientFallback
+
+```java
+@Component
+public class ProductFeignClientFallback implements ProductFeignClient {
+
+    private static final Logger log = LoggerFactory.getLogger(ProductFeignClientFallback.class);
+
+    @Override
+    public Result<Map<String, Object>> getById(Long id) {
+        log.warn("[Feign-Fallback] product.getById 降级 id={}", id);
+        return Result.error(503, "商品服务暂不可用");
+    }
+
+    @Override
+    public Result<Integer> deductStock(Long id, Integer qty) {
+        log.warn("[Feign-Fallback] product.deductStock 降级 id={} qty={}", id, qty);
+        return Result.error(503, "库存服务暂不可用,请稍后再试");
+    }
+
+    @Override
+    public Result<Integer> restoreStock(Long id, Integer qty) {
+        // ⚠ 这里只 log, 不返 error
+        //   cancel/close 流程已经把订单关了, 库存不还能补偿
+        //   生产应该把"待补偿库存"记一张 retry 表, 后台 job 重试
+        log.warn("[Feign-Fallback] product.restoreStock 降级(库存未还) id={} qty={}", id, qty);
+        return Result.success(0);
+    }
+}
+```
+
+**关键设计**:
+- `getById` / `deductStock` 返 503, **阻断业务**
+- `restoreStock` 返 success(0), **不阻断 cancel 流程**, 仅 log warn 让人工补偿
+- 这种"不同方法不同降级策略" 是 Fallback 的精髓
+
+### @FeignClient 注解关联 Fallback
+
+```java
+@FeignClient(
+        name = "mini-mall-product",
+        fallback = com.minimall.order.client.fallback.ProductFeignClientFallback.class
+)
+public interface ProductFeignClient { ... }
+```
+
+`fallback` 属性指向 Fallback 类的 `.class`, Spring 启动时把它注册成 Bean.
+
+## 64.4  关键开关: feign.sentinel.enabled
+
+```yaml
+feign:
+  sentinel:
+    enabled: true
+```
+
+**没这开关**: `@FeignClient(fallback=...)` **写了不生效**, 仍抛 FeignException.
+
+**有这开关**: Spring Cloud Alibaba 用 `SentinelFeign` 替换默认 Feign 工厂, 把 Sentinel 接进 Feign 的代理过程, **Sentinel 触发熔断时调 fallback**.
+
+注意: yml 顶级 `feign:`, **不是 `spring.cloud.openfeign.feign:`** (这是 SCA 历史包袱, 没改).
+
+## 64.5  验证: 杀 product, 看 fallback 日志
+
+```bash
+$ curl http://127.0.0.1:9001/user/1/with-product/1
+{"code":500,"message":"商品服务暂不可用","data":null}    ← message 来自 fallback
+```
+
+user 服务日志:
+
+```
+WARN c.m.u.c.f.ProductFeignClientFallback : [Feign-Fallback] (user→product).getById 降级 id=1
+```
+
+确认 Fallback **被自动调用**了, 链路完整.
+
+## 64.6  H1 累计能力
+
+| 场景 | 原状 (H1 前) | 现状 (H1 后) |
+|---|---|---|
+| product 挂 → 调演示接口 | 抛 FeignException → 500 | fallback → "商品服务暂不可用" |
+| product 挂 → 创建订单 | 整个 createOrder 抛异常 | fallback → 友好提示, 不下单 |
+| product 挂 → 取消订单回库存 | cancel 跟着炸 | fallback log warn, cancel 继续 |
+| user 挂 → 创建订单查地址 | 抛 FeignException | fallback → "用户服务暂不可用" |
+
+---
+
+# 65. H2 — 过时注释纠错 (小但重要)
+
+## 65.1  背景
+
+G3.10 已经补完扣库存, H1 已经加 fallback, **但** OrdersServiceImpl 类顶部的注释还是 G3.7 时的:
+
+```java
+// 订单服务实现 (G3.7 - 微服务版, 简化版不扣库存)
+// ④ productMapper.deductStock / restoreStock 全部去掉
+//    = 简化版【不扣库存】, 后续 G4 上分布式事务再补
+```
+
+读者看了**会以为还没扣**, 跟代码冲突. **代码跟注释脱节** 是新人接手项目最常见的坑.
+
+## 65.2  改成准确版
+
+```java
+/**
+ * 订单服务实现 (G3.7 搬迁 + G3.10 补扣库存 + H1 Feign fallback)
+ *
+ * vs 单体差异:
+ *   ④ 扣/回库存改成 Feign 跨服务调用 productFeignClient.deductStock / restoreStock
+ *      ⚠ 跨服务事务局限: order 抛异常时 product 已扣的库存不会自动回滚
+ *        (分布式事务问题, 等 Seata/MQ 补偿表解)
+ *   ⑥ H1: 3 个 Feign Client 都有 fallback, product/user 挂了走兜底
+ *
+ * 6 个方法分布:
+ *   createOrder  ★ 最复杂, 8 步 + 锁 + 事务 + 事务外发 MQ + 跨服务扣库存
+ *   cancelOrder  中等, 锁 + 事务 + 状态机 + 回库存
+ *   closeOrderByMQ  简单 + 幂等, 没用户上下文 + 回库存
+ */
+```
+
+## 65.3  H2 经验
+
+| 经验 | 解释 |
+|---|---|
+| 注释要跟代码同步, 不然误导维护者 | 班级里"代码即文档" 的现实版 |
+| 每次跨阶段改造, 类顶部的"故事"也要更新 | 否则就是技术债 |
+
+---
+
+# 66. G5 — Seata AT 分布式事务
+
+## 66.1  问题再现: 单体的招在微服务为啥失灵
+
+### 单体 createOrder 的事务结构
+
+```java
+transactionTemplate.execute(status -> {
+    save(order);          // ┐
+    saveBatch(items);     // │ 全部 mini_mall 库
+    deductStock(qty);     // │ 同一个 Connection
+    rows == 0 抛异常 → 全部回滚 ┘
+});
+```
+
+**为啥单体一致**:
+- `orders` / `order_item` / `product` 三张表都在 **同一个库 mini_mall**
+- Spring 一个事务 = MySQL 一个 Connection
+- 所有 SQL 都在这一个 Connection 上执行 → MySQL 行级锁 + InnoDB 事务回滚保证一致
+
+### 微服务的不一致
+
+```
+order 进程 Connection A:                product 进程 Connection B:
+  TransactionTemplate.execute            @Transactional
+        ▼                                       ▼
+  save(order)                            deductStock SQL (单独 commit)
+  save(items)
+  Feign deductStock ──HTTP─►             ⭐ 此时 Connection B 已 COMMIT
+  抛异常
+  Connection A 回滚                       Connection B 早已 COMMIT
+  → orders 没了                          → product 库存仍 -1
+```
+
+**根因**: 微服务即使复用同一个 MySQL 库, **两个 Java 进程 = 两个连接池 = 两个独立本地事务**, 单纯本地事务保证不了跨服务一致性.
+
+## 66.2  Seata AT 模式核心原理
+
+### 三个角色
+
+| 角色 | 担任者 |
+|---|---|
+| **TC** Transaction Coordinator | 独立部署的 seata-server (8091 端口) |
+| **TM** Transaction Manager | 标 `@GlobalTransactional` 的发起方 (order) |
+| **RM** Resource Manager | 各分支服务里的 DataSource (order + product) |
+
+### 两阶段提交流程
+
+```
+┌─ Phase 1 (业务执行) ───────────────────────────┐
+│  ① TM 发起: 调 TC 申请全局 XID                  │
+│  ② order Feign 调 product, XID 在 header 透传  │
+│  ③ product RM 拿 XID 加入全局事务              │
+│  ④ product 本地事务执行 UPDATE stock           │
+│     ⭐ 同时由代理 DataSource 自动写 undo_log    │
+│  ⑤ product 本地事务 COMMIT                     │
+│     ⭐ 一阶段就 commit, 释放本地锁              │
+└─────────────────────────────────────────────────┘
+
+┌─ Phase 2 (异步决策) ──────────────────────────┐
+│  正常: TM 通知 TC commit → TC 通知 RM           │
+│        RM 异步删 undo_log (无操作 DB 数据)      │
+│                                                  │
+│  异常: TM 通知 TC rollback → TC 通知 RM         │
+│        RM 拿 undo_log 的 rollback_info 反向 SQL │
+│        把 stock 恢复回去                        │
+└─────────────────────────────────────────────────┘
+```
+
+### 关键: undo_log 是啥
+
+每个业务库 (mini_mall) 必须建一张 `undo_log` 表:
+
+```sql
+CREATE TABLE undo_log (
+    branch_id BIGINT NOT NULL,         -- 分支事务 ID
+    xid VARCHAR(128) NOT NULL,         -- 全局事务 ID
+    context VARCHAR(128) NOT NULL,
+    rollback_info LONGBLOB NOT NULL,   -- ⭐ 序列化的前镜像 (SQL 执行前的数据)
+    log_status INT NOT NULL,
+    log_created DATETIME(6) NOT NULL,
+    log_modified DATETIME(6) NOT NULL,
+    UNIQUE KEY ux_undo_log (xid, branch_id)
+);
+```
+
+`rollback_info` 存的是**业务 SQL 执行前的数据快照** (前镜像). 回滚时 Seata 拿这个快照反推一条 INSERT/UPDATE/DELETE 把数据恢复.
+
+## 66.3  Seata Server 部署 (Docker file 模式)
+
+```bash
+docker run -d --name seata-server \
+  -p 8091:8091 \
+  -p 7091:7091 \
+  -e SEATA_IP=127.0.0.1 \
+  seataio/seata-server:1.8.0
+```
+
+**关键参数**:
+- 8091 = TC RPC 端口 (客户端连这)
+- 7091 = Console UI 端口 (浏览器看事务状态)
+- `SEATA_IP=127.0.0.1` = TC 对外宣告的 IP (客户端用这地址回连)
+- **file 模式**: 默认配置, session/lock 都在文件里, **不需要建 Seata 元数据 4 表 (global_table 等)**
+
+生产应该用 db 模式 + Nacos 注册中心, 但学习项目 file 模式够用.
+
+## 66.4  客户端依赖 (BOM 锁版本)
+
+`pom.xml`:
+
+```xml
+<dependency>
+    <groupId>com.alibaba.cloud</groupId>
+    <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
+</dependency>
+```
+
+版本由 `spring-cloud-alibaba-dependencies` BOM 锁定, 跟 SCA 2023.0.1.2 对齐 Seata 1.8.0.
+
+**这个 starter 干的事**:
+1. 引 `seata-spring-boot-starter` (Seata 客户端核心)
+2. 自动装配 `GlobalTransactionScanner` (扫描 @GlobalTransactional 注解)
+3. 自动代理 `DataSource` 成 `DataSourceProxy` (拦截 SQL 写 undo_log)
+4. 注入 `RpcCustomizer` (Feign 自动透传 XID header)
+
+## 66.5  客户端 yml 配置
+
+```yaml
+seata:
+  enabled: true
+  application-id: ${spring.application.name}     # 客户端在 TC 上的标识
+  tx-service-group: default_tx_group              # ⭐ 事务组名
+  enable-auto-data-source-proxy: true             # ⭐ 自动代理 DataSource
+  service:
+    vgroup-mapping:
+      default_tx_group: default                    # 事务组 → cluster 映射
+    grouplist:
+      default: 127.0.0.1:8091                      # cluster=default 的 TC 物理地址
+  registry:
+    type: file                                     # 不接 Nacos, file 模式
+  config:
+    type: file
+```
+
+**两层抽象**:
+- `tx-service-group` (逻辑事务组) → `vgroup-mapping` → cluster (TC 集群名) → `grouplist` (TC 物理地址)
+- 这个绕弯设计是为了支持多机房 / 切换 TC 集群
+
+## 66.6  @GlobalTransactional 注解
+
+```java
+@Override
+@GlobalTransactional(name = "createOrder-tx", rollbackFor = Exception.class)
+public Map<String, Object> createOrder(Long userId, CreateOrderDTO dto) {
+    // ⭐ 进入方法时 Seata TM 分配全局 XID
+    //   Feign 自动透传 XID 到 product 的 header
+    //   product 扣库存写 undo_log, 一阶段本地提交
+    //   本方法抛任何异常 → TC 反向通知 product 走 undo_log 回滚 stock
+    //   内部 TransactionTemplate 不动 (它是 order 本地事务,
+    //   作为全局事务的一个分支自动管理)
+    ...
+}
+```
+
+**注意**:
+1. `@GlobalTransactional` **跟 `@Transactional` 不冲突** —— 内层本地事务还要保留, 它是分支事务
+2. `rollbackFor = Exception.class` 覆盖默认只回滚 RuntimeException 的行为, 全部异常都触发回滚
+3. `name` 是事务名, console 看事务列表时分辨用
+
+## 66.7  SeataTestController (端到端验证神器)
+
+实际跑 createOrder 太麻烦 (要准备购物车 + 地址等), 写一个独立测试端点:
+
+```java
+@RestController
+@RequestMapping("/seata-test")
+public class SeataTestController {
+
+    @Autowired private ProductFeignClient productFeignClient;
+
+    @PostMapping("/deduct/{productId}/{qty}")
+    @GlobalTransactional(name = "seata-test-deduct", rollbackFor = Exception.class)
+    public Result<String> deduct(
+            @PathVariable Long productId,
+            @PathVariable Integer qty,
+            @RequestParam(defaultValue = "false") boolean throwError
+    ) {
+        String xid = RootContext.getXID();            // ⭐ 拿当前全局 XID (Seata 注入到 ThreadLocal)
+        log.info("[Seata-Test] 进入全局事务 XID={}", xid);
+
+        // 1. Feign 调 product 扣库存
+        Result<Integer> deductResp = productFeignClient.deductStock(productId, qty);
+        if (deductResp == null || deductResp.getCode() != 200) {
+            throw new RuntimeException("扣库存失败");
+        }
+
+        // 2. throwError=true 故意抛, 看回滚
+        if (throwError) {
+            throw new RuntimeException("Seata-Test 故意抛异常");
+        }
+
+        return Result.success("扣库存成功 XID=" + xid);
+    }
+}
+```
+
+`RootContext.getXID()` 是 Seata 提供的, 拿当前线程的全局事务 ID. 没在 `@GlobalTransactional` 范围内调用会返 null.
+
+## 66.8  端到端验证 5 步
+
+```bash
+$ curl product/1                       # ① 初始 stock=200
+"stock":200
+
+$ curl -X POST seata-test/deduct/1/5   # ② 正常扣 5, XID=...191425
+{"code":200, "data":"扣库存成功 XID=172.17.0.4:8091:1045628007625191425"}
+
+$ curl product/1                       # ③ 提交后 stock=195
+"stock":195
+
+$ curl -X POST "seata-test/deduct/1/5?throwError=true"  # ④ 扣 5 + 抛异常
+{"code":500, "message":"系统繁忙，请稍后再试"}
+
+$ curl product/1                       # ⑤ 异常后 stock=195 (没变 190!)
+"stock":195
+```
+
+⑤ 等于 ③ 不等于 190 = **Seata 把 product 已扣的库存自动恢复了**.
+
+### Order 日志关键证据
+
+```
+[Seata-Test] 故意抛异常 XID=172.17.0.4:8091:1045628007625191427
+transaction 172.17.0.4:8091:1045628007625191427 will be rollback
+[172.17.0.4:8091:1045628007625191427] rollback status: Rollbacked   ⭐
+```
+
+### undo_log 表证据
+
+```sql
+SELECT COUNT(*) FROM undo_log;
+-- 结果: 0
+```
+
+回滚成功后 Seata 自动删 undo_log 行, 表保持空.
+
+## 66.9  XID 怎么从 order 透传到 product
+
+```
+order 调 Feign:
+  RpcCustomizer 拦截 → 把 XID 塞进 HTTP header "TX_XID"
+  POST /product/1/stock/deduct
+  Header: TX_XID: 172.17.0.4:8091:1045628007625191427
+
+product 接收:
+  SeataHandlerInterceptor 拦截 → 从 header 取 XID
+  → RootContext.bind(xid) 塞 ThreadLocal
+  → 业务方法走自己的 SQL → 代理 DataSource 看到 ThreadLocal 有 XID
+  → 自动注册到 TC 当分支事务 + 写 undo_log
+```
+
+**整条链路对业务代码透明**, 这是 Seata AT 模式最大的优势.
+
+## 66.10  G5 大坑回顾
+
+| 坑 | 表现 | 解 |
+|---|---|---|
+| Spring Boot 3 + Seata WARN BeanPostProcessorChecker | 启动有一堆 WARN | 已知问题, 不影响功能, 忽略 |
+| 配 `tx-service-group` 写错 | 启动报"can not get available servers" | 跟 yml 的 `vgroup-mapping` 必须键对得上 |
+| undo_log 没建 | RM 启动报 "Table undo_log doesn't exist" | 每个业务库 (mini_mall) 都要建 |
+| Seata 容器 IP 是 docker 内 IP | XID 里能看见 172.17.0.4 | 客户端连 127.0.0.1:8091 即可, XID 内含的 IP 不影响 |
+| @GlobalTransactional 加在 service 内部方法 | 同类自调用不生效 | 必须加在 Controller 或 Service 公开入口方法 |
+
+## 66.11  AT vs TCC vs SAGA 简表 (面试问到)
+
+| 模式 | 原理 | 业务侵入 | 适用 |
+|---|---|---|---|
+| **AT** | 框架自动写 undo_log, 二阶段反推 SQL 回滚 | 0 (透明) | 一般 CRUD 业务, 我们就用这个 |
+| **TCC** | 业务写 try / confirm / cancel 3 个方法 | 高 (3 倍代码) | 强一致 + 跨非 DB 资源 (如调外部支付) |
+| **SAGA** | 长事务拆成多段, 每段定补偿动作 | 中 | 长流程 (旅游订单 N 个步骤) |
+| **XA** | 二阶段提交协议, 资源管理器原生支持 | 0 | 性能差 (锁表整个二阶段) |
+
+**简历可以聊**: 选 AT 是因为 "业务无侵入 + 性能合理 + 框架成熟 + 单库内的强一致" 综合最优.
+
+## 66.12  G5 累计能力
+
+| 维度 | 状态 |
+|---|---|
+| 跨服务事务一致性 | ✅ (Seata AT) |
+| order 抛异常自动回滚 product 库存 | ✅ (rollback status: Rollbacked) |
+| undo_log 自动清理 | ✅ |
+| XID 自动透传 (Feign) | ✅ |
+| 业务代码零侵入 (只加 @GlobalTransactional) | ✅ |
+| Seata Console UI | ✅ http://127.0.0.1:7091 |
+
+## 66.13  G5 经验沉淀
+
+| 经验 | 来源 |
+|---|---|
+| 单体事务 = 单 Connection, 微服务 = 多 Connection, 一致性方案天然不同 | 66.1 |
+| AT 模式靠 undo_log 表 + 代理 DataSource, 业务零侵入 | 66.2 |
+| Seata Server file 模式部署最简, 不用建 4 张元数据表 | 66.3 |
+| `@GlobalTransactional` 跟 `@Transactional` 不互斥, 全局含本地 | 66.6 |
+| XID 通过 Feign header 自动透传, 不用手动塞 | 66.9 |
+| 每个业务库都要建 undo_log (跟 RM 注册的 DataSource 一一对应) | 66.10 |
+| @GlobalTransactional 必须加在公开入口, 同类自调用失效 | 66.10 |
+| 简历级别项目 = 至少一个分布式事务实战 | 66.11 |
+
+---
+
+**G3.9 + G3.10 + H1 + H2 + G5 全部完毕**. 微服务从"业务搬完但有断点 + 裸跑" 走到 "**业务真闭环 + 服务降级 + 跨服务强一致**". 已经具备小型电商生产框架的基本素质.
+下一步可选: README 收尾上 GitHub, 或继续 G6~G10 增量功能 (物流/评价/优惠券/ES/后台).
