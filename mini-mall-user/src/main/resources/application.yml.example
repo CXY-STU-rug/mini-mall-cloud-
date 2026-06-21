@@ -1,0 +1,65 @@
+# ═══════════════════════════════════════════════════════════
+# mini-mall-user 用户服务配置 (示例 / 模板)
+# 用法: cp application.yml.example application.yml , 然后填自己的密码/密钥
+# ═══════════════════════════════════════════════════════════
+
+server:
+  # 端口规划：网关 9080 / user 9001 / product 9002 / order 9003 ...
+  port: 9001
+
+spring:
+  application:
+    # 服务名（Nacos 用这个识别服务，Feign 也用它）
+    name: mini-mall-user
+
+  # ═════════════════════════════════════════════════════════
+  # E 阶段新增：Nacos 服务发现
+  # 启动时本服务会自动向 localhost:8848 注册自己（IP+端口+服务名）
+  # ═════════════════════════════════════════════════════════
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+    # ═════════════════════════════════════════════════════════
+    # F2 新增：Sentinel 配置
+    # ═════════════════════════════════════════════════════════
+    sentinel:
+      transport:
+        dashboard: 127.0.0.1:8858
+        port: 8719
+      eager: true
+
+  # ═════════════════════════════════════════════════════════
+  # ⭐ MySQL 数据源 (改成你自己的账号/密码)
+  # ═════════════════════════════════════════════════════════
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/mini_mall?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: root
+    password: YOUR_MYSQL_PASSWORD   # ⭐ 改这里
+
+# ═══════════════════════════════════════════════════════════
+# MyBatis-Plus 配置
+# ═══════════════════════════════════════════════════════════
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      logic-delete-field: isDeleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# ═══════════════════════════════════════════════════════════
+# ⭐ JWT 配置 (secret 必须 >= 32 字节, 自己生成随机串)
+# ═══════════════════════════════════════════════════════════
+jwt:
+  secret: YOUR_JWT_SECRET_AT_LEAST_32_BYTES_LONG   # ⭐ 改这里
+  expiration: 604800000   # 7 天
+
+logging:
+  level:
+    com.minimall: debug
+    root: info

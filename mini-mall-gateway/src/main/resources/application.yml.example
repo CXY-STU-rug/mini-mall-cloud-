@@ -1,0 +1,74 @@
+# ════════════════════════════════════════════════════════════════
+# mini-mall-gateway 网关配置 (示例 / 模板)
+# 用法: cp application.yml.example application.yml , 然后填自己的 JWT secret
+# ════════════════════════════════════════════════════════════════
+server:
+  port: 9080
+
+spring:
+  application:
+    name: mini-mall-gateway
+
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+    sentinel:
+      transport:
+        dashboard: 127.0.0.1:8858
+        port: 8721
+      eager: true
+
+    gateway:
+      routes:
+        # ─── user 服务 ─────────────────────────
+        - id: user-route
+          uri: lb://mini-mall-user
+          predicates:
+            - Path=/user/**
+
+        # ─── product 服务 ──────────────────────
+        - id: product-route
+          uri: lb://mini-mall-product
+          predicates:
+            - Path=/product/**
+
+        # ─── G3.1: 商品分类 → product ─────────
+        - id: category-route
+          uri: lb://mini-mall-product
+          predicates:
+            - Path=/category/**
+
+        # ─── G3.5: 收藏 → product ─────────────
+        - id: favorite-route
+          uri: lb://mini-mall-product
+          predicates:
+            - Path=/favorite/**
+
+        # ─── G3.4: 购物车 → order ─────────────
+        - id: cart-route
+          uri: lb://mini-mall-order
+          predicates:
+            - Path=/cart/**
+
+        # ─── G3.7: 订单 → order ───────────────
+        - id: order-route
+          uri: lb://mini-mall-order
+          predicates:
+            - Path=/order/**
+
+        # ─── G3.8: 秒杀 → order ───────────────
+        - id: seckill-route
+          uri: lb://mini-mall-order
+          predicates:
+            - Path=/seckill/**
+
+logging:
+  level:
+    org.springframework.cloud.gateway: debug
+    reactor.netty.http.client: info
+
+# ⭐ JWT secret 必须跟 user 服务保持一致 (鉴权过滤器解 token 用)
+jwt:
+  secret: YOUR_JWT_SECRET_AT_LEAST_32_BYTES_LONG   # ⭐ 改这里

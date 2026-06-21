@@ -1,0 +1,58 @@
+# mini-mall-product 商品服务配置 (示例 / 模板)
+# 用法: cp application.yml.example application.yml , 然后填自己的密码
+
+server:
+  port: 9002
+
+spring:
+  application:
+    name: mini-mall-product
+
+  # ─── G3.5 新增: Redis 连接配置 (Favorite 用 Redis Set) ─────────
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      database: 0
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+          max-wait: 1000ms
+
+  # E 阶段新增：Nacos 服务发现
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+    # F2 新增：Sentinel 限流熔断
+    sentinel:
+      transport:
+        dashboard: 127.0.0.1:8858
+        port: 8720
+      eager: true
+
+  # ⭐ MySQL (改成你自己的账号/密码)
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/mini_mall?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: root
+    password: YOUR_MYSQL_PASSWORD   # ⭐ 改这里
+
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      logic-delete-field: isDeleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+logging:
+  level:
+    com.minimall: debug
+    root: info

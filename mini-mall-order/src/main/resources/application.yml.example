@@ -1,0 +1,77 @@
+# ═════════════════════════════════════════════════════════════════
+# mini-mall-order 订单服务配置 (示例 / 模板)
+# 用法: cp application.yml.example application.yml , 然后填自己的密码
+#
+# 端口分配 (避免冲突):
+#   9001 = user  9002 = product  9003 = order  9080 = gateway
+# Sentinel 客户端口:
+#   8719 = user  8720 = product  8721 = gateway  8722 = order
+# ═════════════════════════════════════════════════════════════════
+
+server:
+  port: 9003
+
+spring:
+  application:
+    name: mini-mall-order
+
+  # ─── ⭐ MySQL (改成你自己的账号/密码) ────────────────────────
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/mini_mall?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: root
+    password: YOUR_MYSQL_PASSWORD   # ⭐ 改这里
+
+  # ─── ⭐ RabbitMQ (改成你自己的账号/密码) ────────────────────
+  # 单体 docker-compose 自定义了 admin/<your-password>, 默认是 guest/guest
+  rabbitmq:
+    host: 127.0.0.1
+    port: 5672
+    username: YOUR_RABBITMQ_USER       # ⭐ 改这里 (默认 guest)
+    password: YOUR_RABBITMQ_PASSWORD   # ⭐ 改这里 (默认 guest)
+    virtual-host: /
+    listener:
+      simple:
+        acknowledge-mode: manual
+        prefetch: 1
+        retry:
+          enabled: false
+
+  # ─── Redis 连接 ─────────────────────────────────────────────
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      database: 0
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+          max-wait: 1000ms
+
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+    sentinel:
+      transport:
+        dashboard: 127.0.0.1:8858
+        port: 8722
+      eager: true
+
+# ─── MyBatis-Plus ───────────────────────────────────────────────
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    map-underscore-to-camel-case: true
+  # ⚠ 不要在这开 global-config.db-config.logic-delete-field
+  #   会让 CartItem 也被当逻辑删 → G3.4 cart bug
+  #   全靠 @TableLogic 注解控制
+
+logging:
+  level:
+    com.minimall: debug
+    root: info

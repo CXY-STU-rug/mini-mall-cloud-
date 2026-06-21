@@ -1,0 +1,29 @@
+# ═══════════════════════════════════════════════════════════
+# bootstrap.yml — Spring Cloud 启动期最早读的配置
+# F1 新增, 配 Nacos Config 拉远程配置
+# ═══════════════════════════════════════════════════════════
+#
+# 为什么 application.name 也要在这里写一份?
+#   因为 Nacos Config 拉配置时, 默认 dataId = ${application.name}.${file-extension}
+#   bootstrap 阶段就要确定服务名, application.yml 太晚
+spring:
+  application:
+    name: mini-mall-user
+
+  cloud:
+    nacos:
+      config:
+        # Nacos Server 地址 (同一个 server 同时管 discovery 和 config)
+        server-addr: 127.0.0.1:8848
+
+        # 配置文件后缀, 决定 dataId 用什么扩展名
+        # 这里设 yaml, dataId 就是 mini-mall-user.yaml
+        file-extension: yaml
+
+        # 分组, 默认 DEFAULT_GROUP
+        # 多环境可以拆 DEV_GROUP / TEST_GROUP / PROD_GROUP
+        group: DEFAULT_GROUP
+
+        # 命名空间, 默认 public
+        # 生产可以拆 dev / test / prod 三个 namespace 完全隔离
+        namespace: public

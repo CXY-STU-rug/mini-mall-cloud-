@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         继承根 pom 拿到的"白嫖":
+           ① Spring Boot 3.3.5
+           ② SC / SCA / 业务依赖的 dependencyManagement 锁版本
+           ③ spring-cloud-starter-bootstrap (父 dependencies 强制塞)
+           ④ Nacos discovery / config / Sentinel 也是父 dependencies 自动给
+           ⑤ 阿里云 Maven 镜像
+         所以子 pom 真正要写的【非常少】, 这就是 dependencyManagement 的威力
+         ═══════════════════════════════════════════════════════════ -->
+    <parent>
+        <groupId>com.minimall</groupId>
+        <artifactId>mini-mall-cloud</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <!-- 业务服务, packaging 默认 jar -->
+    <artifactId>mini-mall-order</artifactId>
+    <name>mini-mall-order</name>
+    <description>订单服务: 购物车 / 订单 / 秒杀</description>
+
+    <dependencies>
+
+        <!-- ═════════════════════════════════════════════════════════
+             ① ⭐ 引自家的 common-core
+             一行依赖把 Result / BusinessException / GlobalExceptionHandler 拿到
+             版本不用写 (根 pom dependencyManagement 锁好了)
+             ═════════════════════════════════════════════════════════ -->
+        <dependency>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-core</artifactId>
+        </dependency>
+
+        <!-- ② Spring Web (写 @RestController 必备) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- ⭐ G1 新增: Redis 客户端 (lettuce, Spring Boot 默认)
+             starter 自带:
+               ① Lettuce 客户端 (基于 Netty, 线程安全, 性能比 Jedis 好)
+               ② RedisAutoConfiguration (读 spring.data.redis.* 自动配 RedisTemplate)
+               ③ StringRedisTemplate (专门处理 String, 不用我们手配)
+             不引版本号, Boot BOM 已锁 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!-- ⭐ G3.4 新增: MyBatis-Plus (CartItem 存 cart_item 表)
+             starter 自带 MP + 集成 MyBatis 自动装配 -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+        </dependency>
+
+        <!-- ⭐ G2 新增: RabbitMQ 客户端 (spring-rabbit)
+             这一行 starter 帮我们做的事:
+               ① 拉 spring-rabbit + rabbitmq-client (底层 AMQP 协议库)
+               ② 自动装配 RabbitTemplate (Producer 发消息用)
+               ③ 自动启用 @RabbitListener 扫描 (Consumer 监听用)
+               ④ 启动时按 spring.rabbitmq.* 连 5672, 连不上直接报错
+               ⑤ 默认序列化用 SimpleMessageConverter (toString 那一套, 后续可换 Jackson)
+             版本不写, Boot BOM 锁好 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-amqp</artifactId>
+        </dependency>
+
+        <!-- ⭐ G3.4 新增: MySQL 驱动
+             scope=runtime: 编译期不需要, 运行期才加载 (典型 JDBC 驱动用法)
+             版本由父 pom 锁定 -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- 注: Feign 依赖在 common-core 里, 不用单独引 -->
+        <!--    common-core 引了 spring-cloud-starter-openfeign -->
+        <!--    order 通过 common-core 自动传递, 0 改动 -->
+
+        <!-- ③ Lombok (common-core 里加了 <optional>true</optional> 不会传递)
+             每个用 @Data/@Slf4j 的模块都要自己声明 -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- ─── 暂时不引 ─────────────────────────────────────────────
+             spring-boot-starter-amqp → G2 接 RabbitMQ 时加
+             这就是 feedback_concrete_first: 用到再加, 不预先准备
+             ───────────────────────────────────────────────────────── -->
+    </dependencies>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         build 段: 显式声明 spring-boot-maven-plugin 才能打 fat jar
+         父 pluginManagement 只锁版本, 这里 <plugin> 才真生效
+         ═══════════════════════════════════════════════════════════ -->
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

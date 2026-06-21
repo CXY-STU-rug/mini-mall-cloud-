@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         parent 指向【根工程 mini-mall-cloud】
+         这样能拿到根 pom 里 dependencyManagement 锁好的所有版本
+         ═══════════════════════════════════════════════════════════ -->
+    <parent>
+        <groupId>com.minimall</groupId>
+        <artifactId>mini-mall-cloud</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <!-- 这一层只是聚合层，自己也是 pom -->
+    <artifactId>mini-mall-common</artifactId>
+    <packaging>pom</packaging>
+    <name>mini-mall-common</name>
+    <description>公共组件聚合：core / security / redis / swagger</description>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         ⭐ 子模块顺序很重要：
+         core 必须最前面（其他 3 个都要依赖它）
+         security / redis / swagger 之间互不依赖，顺序无所谓
+         ═══════════════════════════════════════════════════════════ -->
+    <modules>
+        <module>mini-mall-common-core</module>
+        <!-- 后续步骤逐个解开
+        <module>mini-mall-common-security</module>
+        <module>mini-mall-common-redis</module>
+        <module>mini-mall-common-swagger</module>
+        -->
+    </modules>
+
+</project>

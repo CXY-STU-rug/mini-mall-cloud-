@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         继承父 pom：拿 Spring Boot 3.3.5 + 全部版本锁
+         ═══════════════════════════════════════════════════════════ -->
+    <parent>
+        <groupId>com.minimall</groupId>
+        <artifactId>mini-mall-cloud</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>mini-mall-gateway</artifactId>
+    <name>mini-mall-gateway</name>
+    <description>网关：统一入口 + JWT 鉴权 + 路由转发</description>
+
+    <dependencies>
+
+        <!-- ⭐ ① Spring Cloud Gateway 核心
+             这一个就会拉来 WebFlux + Netty + Reactor 全家桶
+             所以【千万别再引 spring-boot-starter-web】，会跟 Servlet 冲突 -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-gateway</artifactId>
+        </dependency>
+
+        <!-- ② 复用公共模块：Result / BusinessException 等 -->
+        <dependency>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-core</artifactId>
+        </dependency>
+
+        <!-- ③ JWT 三件套（D3 步骤 GlobalFilter 解 token 要用） -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-impl</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-jackson</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- ⭐ F2.7 新增：Sentinel Gateway 适配器
+             - 普通 sentinel 是 MVC + Servlet 风格 (user/product 用的)
+             - Gateway 是 WebFlux + Netty, 需要专门的 adapter
+             - 它会自动把每条路由识别为 Sentinel 资源, 资源名 = 路由 ID -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-alibaba-sentinel-gateway</artifactId>
+        </dependency>
+
+    </dependencies>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         打 fat jar：跟 user/product 一样
+         父 pom 在 pluginManagement 锁了配置，子模块只需要声明引用
+         ═══════════════════════════════════════════════════════════ -->
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

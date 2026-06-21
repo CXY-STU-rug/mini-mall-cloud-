@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         parent 指向根 pom mini-mall-cloud
+         继承根 pom 的：① Spring Boot 3.3.5 版本
+                       ② SC / SCA / 业务依赖的 dependencyManagement
+                       ③ spring-cloud-starter-bootstrap（自动继承）
+                       ④ 阿里云 Maven 镜像
+         ═══════════════════════════════════════════════════════════ -->
+    <parent>
+        <groupId>com.minimall</groupId>
+        <artifactId>mini-mall-cloud</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <!-- 业务服务，packaging 不写默认 jar -->
+    <artifactId>mini-mall-user</artifactId>
+    <name>mini-mall-user</name>
+    <description>用户服务：注册 / 登录 / 用户信息</description>
+
+    <dependencies>
+
+        <!-- ═════════════════════════════════════════════════════════
+             ① ⭐ 引入自己的 common-core
+             一行依赖，就把 Result / 异常 / SecurityContextHolder 全拿到
+             不用写 version（根 pom 的 dependencyManagement 锁好了）
+             ═════════════════════════════════════════════════════════ -->
+        <dependency>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-core</artifactId>
+        </dependency>
+
+        <!-- ⭐ F2.9 新增：Sentinel 规则持久化到 Nacos
+             SCA BOM 自动锁版本(跟 sentinel-core 同步)
+             启动时 user-service 会去 Nacos 拉规则 + 订阅推送
+             解决"Dashboard 重启规则丢"的问题 -->
+        <dependency>
+            <groupId>com.alibaba.csp</groupId>
+            <artifactId>sentinel-datasource-nacos</artifactId>
+        </dependency>
+
+        <!-- ② Spring Web（写 Controller 必须） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- ③ MyBatis-Plus（ORM 框架，BaseMapper + IService 一把梭）
+             版本在根 pom dependencyManagement 锁好了 3.5.9，这里不写 -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+        </dependency>
+
+        <!-- ④ MySQL 驱动
+             scope=runtime：编译期不需要、运行期才加载（典型 JDBC 驱动用法）
+             版本由 Boot BOM 锁定，不写 -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- ⑤ Lombok（编译期注解处理器）
+             common-core 里也写了 Lombok 但加了 <optional>true</optional>，
+             意思是【不传递给下游】，所以每个用 Lombok 的模块都要自己声明 -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- ⑥ JWT 三件套（jjwt-api/impl/jackson）
+             版本在根 pom dependencyManagement 锁好 0.12.6
+             api    = 编译要用的接口
+             impl   = 运行时实现（runtime）
+             jackson= JSON 序列化（runtime） -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-impl</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-jackson</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- ⑦ Spring Security 的 BCrypt 密码加密
+             只引 crypto 包，不引入整个 Spring Security（轻量） -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-crypto</artifactId>
+        </dependency>
+
+        <!-- ⑧ 参数校验：@NotBlank @Size 等 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+    </dependencies>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         ⭐ build 段：显式声明 spring-boot-maven-plugin 才能打 fat jar
+         父 pom 的 pluginManagement 里有，但子 pom 必须再写一遍 <plugin>
+         才会真生效（pluginManagement 只锁版本，不引入）
+         ═══════════════════════════════════════════════════════════ -->
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
