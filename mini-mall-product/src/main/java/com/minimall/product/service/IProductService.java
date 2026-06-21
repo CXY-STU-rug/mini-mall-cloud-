@@ -31,4 +31,10 @@ public interface IProductService extends IService<Product> {
 
     /** 热搜 Top N (从 Redis ZSet 取) */
     List<Map<String, Object>> getHotSearch(int topN);
+
+    /** G3.10 扣库存(原子 SQL, 库存不足返 0) - 给 order 服务 Feign 调用 */
+    int deductStock(Long productId, Integer quantity);
+
+    /** G3.10 回库存(取消/关单时用) */
+    int restoreStock(Long productId, Integer quantity);
 }

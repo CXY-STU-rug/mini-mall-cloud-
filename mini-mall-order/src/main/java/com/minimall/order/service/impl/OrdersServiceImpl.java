@@ -189,12 +189,27 @@ public class OrdersServiceImpl extends ServiceImpl<OrdersMapper, Orders> impleme
                 }
                 orderItemService.saveBatch(orderItems);
 
-                // ─── 第 7 步: 清掉这几条购物车 ─────────
-                cartItemService.removeByIds(dto.getCartItemIds());
+                // ─── 第 7 步: 扣库存(G3.10 补) ──────────
+                // ⭐ 跨服务调 product 服务的原子 SQL UPDATE...WHERE stock>=qty
+                //    rows=0 表示 stock 不够, 抛业务异常 → @Transactional 回滚之前 save 的订单/明细
+                //    注意: 这里只回滚 order 库的事务, 已扣的 product 库不会自动回滚 (分布式事务问题, 留 Seata 解)
+                for (CartItem ci : cartItems) {
+                    try {
+                        Result<Integer> deductResp = productFeignClient.deductStock(ci.getProductId(), ci.getQuantity());
+                        if (deductResp == null || deductResp.getCode() != 200) {
+                            Map<String, Object> p = productMap.get(ci.getProductId());
+                            throw new BusinessException(400, "库存不足: " + p.get("name"));
+                        }
+                    } catch (BusinessException e) {
+                        throw e;
+                    } catch (Exception feignEx) {
+                        Map<String, Object> p = productMap.get(ci.getProductId());
+                        throw new BusinessException(400, "库存不足: " + p.get("name"));
+                    }
+                }
 
-                // ─── ❌ 第 8 步 (单体有): 扣库存 productMapper.deductStock
-                //    G3.7 简化版【不扣库存】, 后续 G4 上分布式事务再补
-                //    教学聚焦: MQ 真业务通路 + 订单状态机, 跨服务扣库存太复杂留到后面
+                // ─── 第 8 步: 清掉这几条购物车 ─────────
+                cartItemService.removeByIds(dto.getCartItemIds());
 
                 // 返回 orderId + orderNo
                 Map<String, Object> result = new HashMap<>();
@@ -362,7 +377,13 @@ public class OrdersServiceImpl extends ServiceImpl<OrdersMapper, Orders> impleme
                 order.setStatus(OrderStatus.CANCELLED);
                 ordersMapper.updateById(order);
 
-                // ❌ 单体这里有"还库存", 简化版不扣也不还
+                // ── G3.10 回库存: 查该订单全部明细, 逐个 Feign 调 product 还库存 ──
+                QueryWrapper<OrderItem> itemW = new QueryWrapper<>();
+                itemW.eq("order_id", orderId);
+                List<OrderItem> items = orderItemMapper.selectList(itemW);
+                for (OrderItem item : items) {
+                    productFeignClient.restoreStock(item.getProductId(), item.getQuantity());
+                }
                 return null;
             });
         } finally {
@@ -424,6 +445,12 @@ public class OrdersServiceImpl extends ServiceImpl<OrdersMapper, Orders> impleme
         order.setStatus(OrderStatus.CANCELLED);
         ordersMapper.updateById(order);
 
-        // ❌ 简化版不还库存
+        // ── G3.10 回库存: 同 cancelOrder 套路 ──
+        QueryWrapper<OrderItem> itemW = new QueryWrapper<>();
+        itemW.eq("order_id", orderId);
+        List<OrderItem> items = orderItemMapper.selectList(itemW);
+        for (OrderItem item : items) {
+            productFeignClient.restoreStock(item.getProductId(), item.getQuantity());
+        }
     }
 }

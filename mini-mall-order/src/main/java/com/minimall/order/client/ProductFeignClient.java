@@ -4,6 +4,8 @@ import com.minimall.common.core.domain.Result;
 import org.springframework.cloud.openfeign.FeignClient;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 
 import java.util.Map;
 
@@ -50,4 +52,12 @@ public interface ProductFeignClient {
      */
     @GetMapping("/product/{id}")
     Result<Map<String, Object>> getById(@PathVariable("id") Long id);
+
+    /** G3.10 扣库存 (调 product 服务原子 SQL, 库存不足 product 那边会抛 400) */
+    @PutMapping("/product/{id}/stock/deduct")
+    Result<Integer> deductStock(@PathVariable("id") Long id, @RequestParam("qty") Integer qty);
+
+    /** G3.10 回库存 (cancel/close 时调) */
+    @PutMapping("/product/{id}/stock/restore")
+    Result<Integer> restoreStock(@PathVariable("id") Long id, @RequestParam("qty") Integer qty);
 }

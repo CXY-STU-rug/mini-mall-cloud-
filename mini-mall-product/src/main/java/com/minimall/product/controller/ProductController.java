@@ -87,6 +87,22 @@ public class ProductController {
         return Result.success(productService.getHotSearch(10));
     }
 
+    /** ⑦ G3.10 扣库存 (内部端点, 给 order 服务 Feign 调) */
+    @PutMapping("/{id}/stock/deduct")
+    public Result<Integer> deductStock(@PathVariable Long id, @RequestParam Integer qty) {
+        int rows = productService.deductStock(id, qty);
+        if (rows == 0) {
+            throw new BusinessException(400, "库存不足");
+        }
+        return Result.success(rows);
+    }
+
+    /** ⑧ G3.10 回库存 (内部端点) */
+    @PutMapping("/{id}/stock/restore")
+    public Result<Integer> restoreStock(@PathVariable Long id, @RequestParam Integer qty) {
+        return Result.success(productService.restoreStock(id, qty));
+    }
+
     // ════════════════════════════════════════════════════════════════
     // F2.6 Sentinel 熔断演示(保留)
     // ════════════════════════════════════════════════════════════════

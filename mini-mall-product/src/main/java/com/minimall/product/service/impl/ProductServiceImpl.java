@@ -104,6 +104,30 @@ public class ProductServiceImpl
         return this.page(pageObj, w);
     }
 
+    /** G3.10 扣库存: 直接转发给 Mapper 的原子 SQL */
+    @Override
+    public int deductStock(Long productId, Integer quantity) {
+        int rows = productMapper.deductStock(productId, quantity);
+        if (rows > 0) {
+            redisTemplate.delete("product:detail:" + productId);
+            log.info("扣库存成功 productId={} qty={}", productId, quantity);
+        } else {
+            log.warn("扣库存失败(库存不足) productId={} qty={}", productId, quantity);
+        }
+        return rows;
+    }
+
+    /** G3.10 回库存 */
+    @Override
+    public int restoreStock(Long productId, Integer quantity) {
+        int rows = productMapper.restoreStock(productId, quantity);
+        if (rows > 0) {
+            redisTemplate.delete("product:detail:" + productId);
+            log.info("回库存成功 productId={} qty={}", productId, quantity);
+        }
+        return rows;
+    }
+
     /** 取 ZSet 倒序前 N 个 + score */
     @Override
     public List<Map<String, Object>> getHotSearch(int topN) {
