@@ -9471,3 +9471,927 @@ product 接收:
 
 **G3.9 + G3.10 + H1 + H2 + G5 全部完毕**. 微服务从"业务搬完但有断点 + 裸跑" 走到 "**业务真闭环 + 服务降级 + 跨服务强一致**". 已经具备小型电商生产框架的基本素质.
 下一步可选: README 收尾上 GitHub, 或继续 G6~G10 增量功能 (物流/评价/优惠券/ES/后台).
+
+---
+
+# 67. G6 — 物流 / 签收 (开篇 + 状态机图)
+
+## 67.1  G6 是啥, 凭啥做
+
+G6 给订单加上 "**发货 → 签收**" 这段闭环, 同时上 Spring 内置定时任务 (`@Scheduled`).
+
+业务背景:
+- 之前下单 → 付款 → 取消, 已经能跑了 (G3.7).
+- 但订单付款后**没法发货**, 永远卡在 status=1.
+- 真实电商: 1 付款 → 2 发货 → 3 签收 才叫完整链路.
+- 简历亮点: 这一段让你**完整讲清状态机 + Spring @Scheduled + cron 表达式 + 单机调度局限**.
+
+为啥 G6 不是搬迁而是真增量?
+- 单体的 `OrderStatus` 常量定义了 SHIPPED = 2 / COMPLETED = 3, 但 **没有任何代码真的把状态推到 2 或 3**.
+- 单体只有 `OrderTimeoutTask` 一个空壳, 而且 `@Scheduled` 注解被注释了, 从来没跑过.
+- 所以 G6 是"前人挖了坑, 我们填上".
+
+## 67.2  状态机文字版图
+
+```
+┌────────────┐  payOrder    ┌────────────┐  ship      ┌────────────┐  sign      ┌────────────┐
+│ 0 待付款   │ ───────────> │ 1 已付款   │ ─────────> │ 2 已发货   │ ─────────> │ 3 已完成   │
+└────────────┘              └────────────┘            └────────────┘            └────────────┘
+       │                          │                          │                  ▲
+       │ cancel                   │ cancel                   │                  │
+       ▼                          ▼                          │  超时(7天)       │
+┌────────────┐              ┌────────────┐                   └──────────────────┘
+│ 4 已取消   │              │ 4 已取消   │                   LogisticsScheduledTask
+└────────────┘              └────────────┘                   自动签收
+```
+
+**核心规则**: 状态只能向后流转, 不能倒退.
+- `ship` 只接受 1 → 2 (其他状态拒)
+- `sign` 只接受 2 → 3
+- 这是简历高频考点: "怎么防止订单状态被乱改". 答案就是这套**前置状态校验**.
+
+## 67.3  G6 整体决策 (3 个关键)
+
+### 决策 ① 表结构: 加 2 列 vs 独立 logistics 表
+
+**选择**: 直接在 orders 表加 `logistics_no` + `logistics_company` 两列.
+
+**理由**:
+- 当前只有 1 种物流场景 (N=1), 拆独立表是过度设计.
+- 按 `feedback_concrete_first`: 同一痛点重复 3 次再抽.
+- 真出现"多承运商 / 转运 / 跨境拆单 / 一单多包裹"再独立表.
+
+### 决策 ② 不写 getLogistics 独立端点
+
+**初始设计** 是写 `GET /order/{id}/logistics`. 真做的时候发现:
+- `GET /order/{id}` 详情接口已经能返回所有字段.
+- 给 `OrderDetailVO` 加 2 字段 → 物流自动跟着详情返回.
+- 单独搞 `/logistics` 端点是**重复造端点**.
+
+**最终**: 删 getLogistics, 详情接口顺带返回物流.
+
+**教训**: 别为了对称 (有 ship / sign 就一定要有 getLogistics) 而造端点. 业务上能复用就复用.
+
+### 决策 ③ Spring @Scheduled vs MQ 延迟队列
+
+7 天自动签收用 **@Scheduled 扫表**, 不用 MQ 延迟队列.
+原因详见第 70 章选型对比.
+
+---
+
+# 68. 有限状态机 FSM 工程实现
+
+## 68.1  什么是有限状态机 (FSM)
+
+正式定义: 一个系统在任意时刻只能处于**有限个状态**之一, 状态间通过**事件**触发**有规则的**转换.
+
+举几个例子帮记:
+- 红绿灯: 红 → 绿 → 黄 → 红 (循环), 不能跳过.
+- 订单: 上面那张图.
+- TCP 连接: CLOSED → SYN_SENT → ESTABLISHED → ... 一共 11 个状态.
+
+## 68.2  FSM 在工程里就是 4 步前置校验
+
+每个改状态的方法都遵循同样的骨架. 这是**死的模板**, 背下来:
+
+```java
+public void someStateTransition(Long userId, Long orderId, /*...*/) {
+    // 第 1 步: 查订单, 不存在 → 404
+    Orders order = ordersMapper.selectById(orderId);
+    if (order == null) {
+        throw new BusinessException(404, "订单不存在");
+    }
+
+    // 第 2 步 (用户类操作): 越权校验 — 不是你的单 → 403
+    //   admin 操作 (shipOrder) 可以跳过这步
+    if (!order.getUserId().equals(userId)) {
+        throw new BusinessException(403, "无权操作");
+    }
+
+    // 第 3 步: 状态机前置校验 — 当前状态不对 → 400
+    //   这一行是 FSM 的精髓
+    if (!order.getStatus().equals(EXPECTED_PREVIOUS_STATUS)) {
+        throw new BusinessException(400, "订单状态不可 XX");
+    }
+
+    // 第 4 步: 改字段 + updateById
+    order.setStatus(NEXT_STATUS);
+    order.setSomeTimestamp(LocalDateTime.now());
+    ordersMapper.updateById(order);
+}
+```
+
+## 68.3  为啥要 `.equals` 不用 `==`
+
+```java
+if (!order.getStatus().equals(OrderStatus.PAID)) { ... }   // ✅ 推荐
+if (order.getStatus() != OrderStatus.UNPAID) { ... }       // ⚠ 当前能跑
+```
+
+- `OrderStatus.PAID` 是 `byte` 字面量 (=1).
+- `order.getStatus()` 是 `Byte` 包装类对象 (MP entity 默认包装类).
+- 用 `==` / `!=`: Byte 会自动拆箱再比, 当前能跑.
+- **但**如果哪天有人把常量类型改成 `Integer`, `==` 就变成**引用比较**, 100% 出 bug.
+- 所以**好习惯就是用 `.equals`**, 不依赖自动拆箱.
+
+## 68.4  G6 用 FSM 的 2 个真实例子
+
+### shipOrder (admin 操作)
+
+```java
+@Override
+public void shipOrder(Long orderId, ShipOrderDTO dto) {
+    Orders order = ordersMapper.selectById(orderId);
+    if (order == null) throw new BusinessException(404, "订单不存在");
+
+    // ⭐ 跳过第 2 步 — admin 操作不需要 userId 校验
+    //    真生产: 应该挂在 admin 网关后面, 用 RBAC 鉴权
+
+    // 第 3 步: 必须 PAID 才能发货
+    if (!order.getStatus().equals(OrderStatus.PAID)) {
+        throw new BusinessException(400, "订单状态不可发货");
+    }
+
+    // 第 4 步: 改状态 + 填物流字段
+    order.setStatus(OrderStatus.SHIPPED);
+    order.setShipTime(LocalDateTime.now());
+    order.setLogisticsCompany(dto.getLogisticsCompany());
+    order.setLogisticsNo(dto.getLogisticsNo());
+    ordersMapper.updateById(order);
+}
+```
+
+### signOrder (用户操作)
+
+```java
+@Override
+public void signOrder(Long userId, Long orderId) {
+    Orders order = ordersMapper.selectById(orderId);
+    if (order == null) throw new BusinessException(404, "订单不存在");
+
+    // ⭐ 第 2 步: 必须做! 防止 A 用户签 B 用户的单
+    if (!order.getUserId().equals(userId)) {
+        throw new BusinessException(403, "无权操作");
+    }
+
+    // 第 3 步: 必须 SHIPPED 才能签收
+    if (!order.getStatus().equals(OrderStatus.SHIPPED)) {
+        throw new BusinessException(400, "订单状态不可签收");
+    }
+
+    // 第 4 步: 改状态 + 填签收时间
+    order.setStatus(OrderStatus.COMPLETED);
+    order.setFinishTime(LocalDateTime.now());
+    ordersMapper.updateById(order);
+}
+```
+
+## 68.5  ship vs sign 差异对照表 (理解为啥这么设计)
+
+| 区别点 | shipOrder | signOrder | 为啥不同 |
+|--------|-----------|-----------|---------|
+| userId 参数 | ❌ 没有 | ✅ 有 | admin 操作不需要锁定用户 |
+| 越权校验 | ❌ 跳过 | ✅ 必须做 | 用户不能签别人的单 |
+| 前置状态 | PAID (1) | SHIPPED (2) | 状态机方向 |
+| 改成状态 | SHIPPED (2) | COMPLETED (3) | 状态机方向 |
+| 时间字段 | shipTime | finishTime | 业务语义 |
+| 物流字段 | 填 2 个 | 不填 | 发货才有物流 |
+
+## 68.6  状态机要不要上 Spring StateMachine?
+
+**不上!** 太重了.
+
+- Spring StateMachine 是个完整框架, 自带 DSL 配置 + 持久化 + 监听器.
+- 我们这套订单状态机才 5 个状态, 4 步前置校验就够.
+- 上了反而难维护. 上 StateMachine 的合理场景: 状态数 >= 10 + 转换关系复杂 + 需要可视化.
+
+简历讲法: "评估过 Spring StateMachine, 当前状态规模 (5 状态 4 转换) 不需要, 用 4 步前置校验即可."
+
+---
+
+# 69. @Scheduled 定时任务深度解析
+
+## 69.1  Spring 定时调度 3 件套
+
+```
+1. 启动类加 @EnableScheduling     ← 开总开关
+2. 方法上加 @Scheduled(cron=...)  ← 标记要调度的方法
+3. 类上加 @Component             ← 让 Spring 扫到这个类
+```
+
+**关键陷阱**: Spring Boot 默认**不会**启用定时调度, 必须显式 `@EnableScheduling`. 新手常踩坑: 写了 `@Scheduled(cron="...")` 没生效, 找半天才发现忘了开总开关.
+
+代码长这样:
+
+```java
+// 启动类
+@SpringBootApplication
+@EnableScheduling                          // ⭐ 不加这个 @Scheduled 全失效
+public class MiniMallOrderApplication { ... }
+
+// 定时任务类
+@Component                                 // ⭐ 不加 Spring 扫不到
+public class LogisticsScheduledTask {
+
+    @Scheduled(cron = "0 0 * * * ?")       // 每小时整点
+    public void autoSignTimeoutOrders() { ... }
+}
+```
+
+## 69.2  cron 表达式 6 字段速记
+
+Spring 用的 cron = **6 字段**, 比标准 Linux 多一个**秒**.
+
+```
+   ┌───── 秒 (0-59)
+   │ ┌─── 分 (0-59)
+   │ │ ┌─── 时 (0-23)
+   │ │ │ ┌── 日 (1-31)
+   │ │ │ │ ┌── 月 (1-12)
+   │ │ │ │ │ ┌─ 周 (0-7, 0/7 都是周日)
+   │ │ │ │ │ │
+   0 0 * * * ?   ← 每小时整点 (0 秒 0 分 任意时)
+   0 */5 * * * ? ← 每 5 分钟
+   0 0 3 * * ?   ← 每天凌晨 3 点
+   0 0 0 1 * ?   ← 每月 1 号 0 点
+   0 0 9 ? * MON ← 每周一上午 9 点
+```
+
+符号:
+- `*` = 任意值
+- `?` = 占位 (日和周只能一个用具体值, 另一个必须 `?`)
+- `*/N` = 每 N
+- `1-5` = 范围 (周一到周五)
+- `1,3,5` = 列表
+
+为什么日和周不能同时具体? 因为 "每周一" 和 "每月 15 号" 是冲突的, 得选一个.
+
+## 69.3  @Scheduled 4 种触发方式
+
+| 方式 | 例子 | 适用场景 |
+|------|------|---------|
+| `cron` | `"0 0 * * * ?"` | **精确时间点** (每天 3 点) |
+| `fixedRate` | `5000` 毫秒 | 上次**开始**后多久再跑 (不管上次跑完没) |
+| `fixedDelay` | `5000` | 上次**结束**后多久再跑 (推荐, 防重叠) |
+| `initialDelay` | 配合上面 | 启动后延迟 N 毫秒再跑第一次 |
+
+```java
+@Scheduled(cron = "0 0 * * * ?")           // 精确时间
+@Scheduled(fixedRate = 60_000)             // 每分钟开始一次
+@Scheduled(fixedDelay = 60_000)            // 上次完成后等 60 秒
+@Scheduled(fixedDelay = 60_000, initialDelay = 30_000)  // 启动 30 秒后开始
+```
+
+**怎么选**:
+- 业务有明确时间点 (整点 / 凌晨) → `cron`
+- 任务不长 + 时间精度低 → `fixedRate`
+- 任务可能跑很久 → `fixedDelay` (防重叠很重要)
+
+## 69.4  单机调度的致命局限 ⚠️
+
+```
+order-service 实例1 (跑定时) ┐
+order-service 实例2 (跑定时) ┤── 3 个实例都到点了同时跑
+order-service 实例3 (跑定时) ┘
+                              ↓
+                同一个订单被签收 3 次! finishTime 被改 3 次!
+```
+
+**当前**: 微服务只跑 1 个 order 实例 → 没事.
+**生产**: 多实例必须配合 **互斥机制**, 否则数据乱.
+
+## 69.5  分布式调度 3 大方案 (面试常问)
+
+### 方案 1: Redis 分布式锁 (轻量)
+
+```java
+@Scheduled(cron = "0 0 * * * ?")
+public void doSomething() {
+    String lockKey = "lock:scheduled:auto-sign";
+    String owner = UUID.randomUUID().toString();
+    Boolean got = redisTemplate.opsForValue()
+            .setIfAbsent(lockKey, owner, Duration.ofMinutes(50));
+    if (!Boolean.TRUE.equals(got)) {
+        log.info("已有实例在跑, 我跳过");
+        return;
+    }
+    try {
+        // 真业务
+    } finally {
+        // Lua 脚本保证 "我的锁才删, 别人的不删"
+        if (owner.equals(redisTemplate.opsForValue().get(lockKey))) {
+            redisTemplate.delete(lockKey);
+        }
+    }
+}
+```
+
+**优点**: 代码改动小, 不引第三方组件.
+**缺点**: Redis 挂了就裸跑, 锁超时设短了可能两个实例都跑, 设长了实例崩了任务卡死.
+
+### 方案 2: 选主 (ZK / Nacos)
+
+启动时选一个实例当 leader, 只有 leader 跑定时. 其他实例就算到点了也不跑.
+
+代码里 `@Scheduled` 方法第一步检查自己是不是 leader, 不是就 return.
+
+**优点**: 简单清晰.
+**缺点**: leader 挂了得有选主机制 (Curator/Raft).
+
+### 方案 3: 分布式调度框架 (重型)
+
+XXL-Job / ElasticJob / Quartz Cluster.
+
+**XXL-Job 最常用**, 大众点评开源:
+- 一个独立的 admin 调度中心 (Web 控制台).
+- 业务实例注册成 executor.
+- 调度中心按策略分发任务 (轮询 / 一致性 hash / 分片).
+- 自带失败重试 / 告警 / 日志.
+
+**优点**: 功能全, 简历看着专业.
+**缺点**: 引一个新组件, 多一个运维负担.
+
+**简历讲法**: "评估过单机 @Scheduled、Redis 分布式锁、XXL-Job 三个方案. 当前 1 实例没必要上重的, 写了 Redis 锁的 TODO 注释方便扩展."
+
+---
+
+# 70. 单体 MQ 延迟队列 vs 微服务 @Scheduled (选型对比) ⭐⭐⭐
+
+这一章是 G6 教学价值最高的部分, 简历可以专门讲这个对比.
+
+## 70.1  两个场景, 选型截然不同
+
+| 场景 | 用啥 | 落地代码 |
+|------|------|---------|
+| **下单 30 分钟没付款 → 关单** | RabbitMQ 延迟队列 (TTL+DLX) | `OrderCloseListener` (G3.7 已搬) |
+| **发货 7 天没签收 → 自动签收** | Spring `@Scheduled` 扫表 | `LogisticsScheduledTask` (G6.7 刚写) |
+
+## 70.2  选型决策表
+
+| 维度 | MQ 延迟队列 | @Scheduled 扫表 |
+|------|-----------|----------------|
+| 触发精度 | **秒级精准** (每订单独立 timer) | 看 cron, 我们 1 小时一次 |
+| 性能 | O(1) 每订单 | O(N) 每次扫全表 |
+| 适用延迟 | 短 (秒~分钟级) | 长 (天级) |
+| 业务规模 | 海量订单 | 状态批量推进 |
+| 实现复杂度 | 中 (RabbitConfig + Listener + TTL 配置) | 低 (1 个方法 + cron 注解) |
+| 用错代价 | 长延迟会堆百万消息在 MQ | 短延迟会被扫表性能拖垮 |
+
+## 70.3  为啥 30 分钟关单选 MQ?
+
+**业务要求**:
+- 用户体验: 倒计时一到必须立刻关单 (前端会显示倒计时).
+- 30 分钟差 5 秒, 用户看到的是 "倒计时到 0 了, 我还能付款" → 灾难.
+- 海量订单: 双 11 期间 10 万订单同时倒计时, 不能扫表.
+
+**MQ 延迟队列设计**:
+- 下单时发一条"30 分钟后关单"的消息到 DLX 队列.
+- TTL 一到, RabbitMQ 自动转发到主队列, Listener 消费.
+- 每条订单一个独立 timer, 互不影响.
+- 哪怕单消息处理慢, 别的订单照常关.
+
+## 70.4  为啥 7 天签收选 @Scheduled?
+
+**业务要求**:
+- 7 天不是硬指标, 差 1 小时也行.
+- 同时签收的数量不大 (7 天前发货的订单, 一小时内能扫完).
+- 用户中间可能手动签收了, 也无所谓.
+
+**用 MQ 反而坑**:
+- 队列要堆 7 天的消息, MQ 内存占用大.
+- 7 天后消费时, 订单可能早被用户手动签收 → 消费者还要做"无效消息过滤".
+- 业务上太重.
+
+**用 @Scheduled 简单**:
+- 每小时扫一次 `SELECT * FROM orders WHERE status=2 AND ship_time <= NOW() - INTERVAL 7 DAY`.
+- 命中的不多 (一般几十单, 不会成千上万).
+- 改状态就行, 不存在"无效"问题, 因为 WHERE 子句已经过滤过.
+
+## 70.5  错配的代价
+
+### 错配 1: 7 天签收用 MQ
+
+```
+Day 0: 用户 A 发货, 发一条"7 天后签收"消息到 MQ DLX
+Day 3: 用户 A 手动签收了 → status 改成 3
+Day 7: MQ DLX 到期, 消费者拿到消息 → 看到 status=3 → 跳过
+```
+
+每条发货都要发延迟消息, MQ 队列堆 7 天的全国订单, **MQ 内存爆**.
+
+### 错配 2: 30 分钟关单用 @Scheduled
+
+```
+每分钟扫: SELECT * FROM orders WHERE status=0 AND create_time <= NOW() - INTERVAL 30 MINUTE
+```
+
+- 10 万订单要扫 10 万行, 扫表时间可能 10+ 秒.
+- 错过 1 分钟才关单, 用户能在倒计时 0 之后还能付款.
+- 表越大越慢, 永远追不上.
+
+## 70.6  万能选型法则 (记住这 3 句话)
+
+1. **要精准 + 短延迟 → MQ 延迟队列**, 每事件独立 timer.
+2. **不要精准 + 长延迟 → @Scheduled 扫表**, 批量推进状态.
+3. **不要精准 + 短延迟 → @Scheduled (fixedDelay)**, 比 cron 简单.
+
+**简历讲法**: "评估过两种方案. 30 分钟关单用 MQ 延迟队列 (倒计时业务要求秒级精准), 7 天签收用 @Scheduled (长延迟+批量推进, MQ 反而堆积). 关键看`延迟长短`和`精度要求`."
+
+## 70.7  单体里这件事的真相
+
+单体 `OrderTimeoutTask` 的 `@Scheduled` 是**注释掉的**:
+
+```java
+// @Scheduled(cron = "0 * * * * *")    // 每分钟整触发
+public void closeTimeoutOrders() { ... }
+```
+
+为啥? **作者发现用 @Scheduled 做 30 分钟关单是错的选型**, 改用了 MQ 延迟队列. 但旧代码懒得删, 直接注释了.
+
+我们微服务**没搬这个 task**, 因为:
+1. 单体本身就没启用.
+2. MQ 延迟队列已覆盖同样业务, 更精准.
+3. 搬过来 = 两套兜底机制并存, 反而容易出 bug.
+
+---
+
+# 71. G6 代码全集 + 解释
+
+## 71.1  改了哪些文件 (一图速览)
+
+```
+mini_mall DB:
+  ALTER TABLE orders ADD COLUMN logistics_no, logistics_company
+
+mini-mall-order/
+├── entity/Orders.java                              ← G6.2 加 2 字段
+├── dto/ShipOrderDTO.java                           ← G6.3 NEW
+├── vo/OrderDetailVO.java                           ← G6.4a 加 2 字段
+├── service/IOrdersService.java                     ← G6.3 加 ship/sign
+├── service/impl/OrdersServiceImpl.java             ← G6.4b 加 ship/sign 实现
+├── controller/OrdersController.java                ← G6.5 加 ship/sign 端点
+├── task/LogisticsScheduledTask.java                ← G6.7 NEW
+└── MiniMallOrderApplication.java                   ← G6.6 加 @EnableScheduling
+
+mini-mall-common-core/exception/GlobalExceptionHandler.java   ← G6 修复 Seata 包装 bug
+```
+
+## 71.2  SQL DDL
+
+```sql
+USE mini_mall;
+
+ALTER TABLE orders
+  ADD COLUMN logistics_no VARCHAR(64) NULL COMMENT '物流单号(发货时填)',
+  ADD COLUMN logistics_company VARCHAR(32) NULL COMMENT '物流公司(发货时填)';
+```
+
+讲解:
+- `ALTER TABLE` = 改表结构 (不是改数据).
+- `ADD COLUMN` 可一条 SQL 加多列, 逗号分隔.
+- `VARCHAR(64)` 物流单号长度. 顺丰 13 位左右, 64 留余地.
+- `NULL` 必须能空, 下单时没发货.
+- `COMMENT` 存在元数据里, DBeaver / Navicat 能看到.
+
+## 71.3  Orders entity 加字段
+
+```java
+/** 完成时间 (status=3 时填) */
+private LocalDateTime finishTime;
+
+// ─── G6 物流字段 ────
+// 设计: 直接给 orders 表加 2 列 (而不是独立 logistics 表)
+// 理由: 当前 N=1, 没必要拆表; 等真出现"多承运商/转运/跨境"再独立
+// MP 映射: DB logistics_no → Java logisticsNo (yml 开了 map-underscore-to-camel-case)
+/** 物流单号 (status=2 发货时填) */
+private String logisticsNo;
+
+/** 物流公司 (status=2 发货时填, 例: 顺丰/中通/京东) */
+private String logisticsCompany;
+```
+
+**关键点**:
+- 没加 `@TableField("logistics_no")`, 靠 yml 全局规则自动转 logisticsNo ↔ logistics_no.
+- 字段插在 finishTime 后面 / remark 前面 — 业务时间线对齐 (付款→发货→完成→物流→备注).
+
+## 71.4  ShipOrderDTO (NEW)
+
+```java
+@Data
+public class ShipOrderDTO {
+
+    @NotBlank(message = "物流公司不能为空")
+    private String logisticsCompany;
+
+    @NotBlank(message = "物流单号不能为空")
+    private String logisticsNo;
+}
+```
+
+**为啥要 DTO 不裸参数**:
+- 2 个字段是阈值, 1 个字段裸参数, 2+ 才包 DTO.
+- 加 @NotBlank 让 Spring Validation 帮校验, 比手写 if-else 干净.
+- @NotBlank: 字段不能 null + 不能空串 + 不能全空格.
+- ⚠ 配合 Controller 上的 `@Valid` 才生效, 没 @Valid = 摆设!
+
+## 71.5  OrderDetailVO 加 2 字段
+
+```java
+@Data
+public class OrderDetailVO {
+    private Long orderId;
+    // ... 现有字段省略 ...
+    private LocalDateTime finishTime;
+    private LocalDateTime createTime;
+    // ─── G6 物流字段 (status>=2 时有值, 之前为 null) ────
+    private String logisticsNo;
+    private String logisticsCompany;
+    private List<OrderItemVO> items;
+}
+```
+
+**🎯 关键技巧 — BeanUtils 自动拷贝**:
+
+OrderServiceImpl.getOrderDetail() 里有一行:
+```java
+BeanUtils.copyProperties(order, vo);
+```
+
+`BeanUtils.copyProperties` 按**字段名匹配**自动拷, entity 和 VO 字段名一样 → 自动包含进去, **不用再写代码**.
+
+规则:
+- entity 加 `logisticsNo` + VO 加同名 `logisticsNo` → 自动拷.
+- 命名不一致 (entity 叫 `id`, VO 叫 `orderId`) → 手动 setter: `vo.setOrderId(order.getId())`.
+
+## 71.6  IOrdersService 接口
+
+```java
+public interface IOrdersService extends IService<Orders> {
+    // ... 现有方法省略 ...
+
+    // ─── G6 物流: 状态机推进 ─────────────────────────────
+    // 1 已付款 ──ship──> 2 已发货 ──sign──> 3 已完成
+
+    /**
+     * 发货 (admin/仓库系统调用, 无 userId)
+     * 前置: status 必须 = 1 (PAID), 否则拒
+     * 副作用: status 改 2, 填 shipTime + logisticsNo + logisticsCompany
+     */
+    void shipOrder(Long orderId, ShipOrderDTO dto);
+
+    /**
+     * 签收 (用户主动确认收货)
+     * 前置: status 必须 = 2 (SHIPPED), 否则拒
+     * 越权: orders.user_id 必须 = 入参 userId
+     */
+    void signOrder(Long userId, Long orderId);
+}
+```
+
+## 71.7  OrdersServiceImpl 实现 (已在 68.4 节展示, 此处略)
+
+详见 68.4 的 shipOrder + signOrder 完整代码.
+
+## 71.8  OrdersController 加端点
+
+```java
+// G6.5 新增端点
+
+@PutMapping("/{orderId}/ship")    // ⚠ 不要写 /order/{orderId}/ship, 类已经 @RequestMapping("/order")
+public Result<Void> ship(
+        @PathVariable Long orderId,
+        @RequestBody @Valid ShipOrderDTO dto    // ← @Valid 触发 DTO 里的 @NotBlank
+) {
+    ordersService.shipOrder(orderId, dto);
+    return Result.success();
+}
+
+@PutMapping("/{orderId}/sign")
+public Result<Void> sign(
+        @PathVariable Long orderId,
+        @RequestHeader("X-User-Id") Long userId   // ← 不是 PathVariable! 从网关透传 header 拿
+) {
+    ordersService.signOrder(userId, orderId);
+    return Result.success();
+}
+```
+
+**容易踩的 3 个坑**:
+1. ❌ 方法 @PutMapping 路径写成 `"/order/{orderId}/ship"` → 最终拼成 `/order/order/{orderId}/ship`. 类上已经 `@RequestMapping("/order")`.
+2. ❌ userId 用 @PathVariable. 应该 `@RequestHeader("X-User-Id")`. 因为路径里没 userId, 是网关解 JWT 透传的 header.
+3. ❌ 忘了 `@Valid`. DTO 上的 @NotBlank 形同虚设.
+
+**为啥 PUT 不 POST**:
+- POST = 创建新资源.
+- PUT = 更新现有资源状态. ship / sign 是状态推进, 用 PUT 更符合 RESTful 语义.
+
+## 71.9  启动类加 @EnableScheduling
+
+```java
+@SpringBootApplication
+@ComponentScan("com.minimall")
+@MapperScan("com.minimall.order.mapper")
+@EnableFeignClients(basePackages = "com.minimall.order.client")
+@EnableScheduling   // ⭐ G6 新增 — 不加 @Scheduled 全失效
+public class MiniMallOrderApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(MiniMallOrderApplication.class, args);
+    }
+}
+```
+
+## 71.10  LogisticsScheduledTask (最炫的一段)
+
+```java
+@Component
+public class LogisticsScheduledTask {
+
+    private static final Logger log = LoggerFactory.getLogger(LogisticsScheduledTask.class);
+    private static final int AUTO_SIGN_DAYS = 7;
+
+    @Autowired
+    private OrdersMapper ordersMapper;
+
+    /**
+     * 每小时整点扫一次, 把 SHIPPED 且发货 >= 7 天的订单改 COMPLETED
+     * cron "0 0 * * * ?" = 每小时整点
+     */
+    @Scheduled(cron = "0 0 * * * ?")
+    public void autoSignTimeoutOrders() {
+        LocalDateTime cutoff = LocalDateTime.now().minusDays(AUTO_SIGN_DAYS);
+        log.info("[定时任务] 自动签收扫描开始, cutoff={}", cutoff);
+
+        // LambdaQueryWrapper 链式写 WHERE, 类型安全
+        LambdaQueryWrapper<Orders> wrapper = new LambdaQueryWrapper<Orders>()
+                .eq(Orders::getStatus, OrderStatus.SHIPPED)
+                .le(Orders::getShipTime, cutoff);
+
+        List<Orders> overdueOrders = ordersMapper.selectList(wrapper);
+
+        if (overdueOrders.isEmpty()) {
+            log.info("[定时任务] 无超时订单, 跳过");
+            return;
+        }
+
+        // ⭐ 关键: 单个失败不能中断整体 — 批处理黄金法则
+        int success = 0;
+        for (Orders order : overdueOrders) {
+            try {
+                order.setStatus(OrderStatus.COMPLETED);
+                order.setFinishTime(LocalDateTime.now());
+                ordersMapper.updateById(order);
+                success++;
+                log.info("[定时任务] 自动签收 orderId={}", order.getId());
+            } catch (Exception e) {
+                // 一条脏数据不能卡死所有
+                log.error("[定时任务] 自动签收失败 orderId={}", order.getId(), e);
+            }
+        }
+
+        log.info("[定时任务] 完成, 总 {} 成功 {}", overdueOrders.size(), success);
+    }
+}
+```
+
+**逐行讲解**:
+
+| 行 | 写法 | 为啥 |
+|----|------|------|
+| `@Component` | Spring 扫成 Bean | 不加 @Scheduled 不生效 |
+| `@Scheduled(cron = "0 0 * * * ?")` | 每小时整点 | cron 6 字段 |
+| `LocalDateTime.now().minusDays(7)` | Java 8 时间 API | **不可变** — 每次返回新实例 |
+| `LambdaQueryWrapper<Orders>()` | MP 链式 WHERE | 类型安全, 方法引用 `Orders::getStatus` 编译期检查 |
+| `.eq(getStatus, 2)` | = | WHERE status = 2 |
+| `.le(getShipTime, cutoff)` | <= | WHERE ship_time <= ? |
+| `try/catch 包单个订单` | 批处理黄金法则 | 一条脏数据不能拖垮全部 |
+
+---
+
+# 72. G6 踩坑实录 + 累计能力 + 待办
+
+## 72.1  坑 ① Seata AOP 把 BusinessException 包成了 RuntimeException ⭐⭐⭐
+
+### 症状
+
+边界测试: 给已签收 (status=3) 的订单再调 `PUT /ship`, 期望返 `code=400 "订单状态不可发货"`, 实际返 `code=500 "系统繁忙"`.
+
+### 排查
+
+看 order 日志, 看到这个堆栈:
+
+```
+ERROR [系统异常]
+java.lang.RuntimeException: try to proceed invocation error
+    at io.seata.spring.annotation.AdapterInvocationWrapper.proceed(AdapterInvocationWrapper.java:59)
+Caused by: com.minimall.common.core.exception.BusinessException: 订单状态不可发货
+    at com.minimall.order.service.impl.OrdersServiceImpl.shipOrder(OrdersServiceImpl.java:485)
+```
+
+### 根因
+
+Seata 全局事务的切面 (`AdapterInvocationWrapper`) 拦截了所有 Service 方法调用. 我们的 `BusinessException` 在 Service 抛出后, **被 Seata 切面捕获后重新包装成 `java.lang.RuntimeException("try to proceed invocation error")`**.
+
+GlobalExceptionHandler 的匹配:
+- `@ExceptionHandler(BusinessException.class)` ❌ 不匹配 (拿到的是 RuntimeException)
+- `@ExceptionHandler(Exception.class)` ✅ 匹配 → 走 500 兜底
+
+**所以业务异常变成了系统异常**.
+
+### 为啥 cancelOrder / payOrder 没事?
+
+它们内部用 `transactionTemplate.execute(lambda)`. BusinessException 在 lambda 内抛出, 被 lambda 的 return 拦截, transactionTemplate **重新抛出** — 这种情况 Seata 切面看到的就是原始 BusinessException, 不包装.
+
+shipOrder / signOrder 是直接抛, 没经过 transactionTemplate, 被 Seata 切面直接抓住 + 包装.
+
+### 修复
+
+`GlobalExceptionHandler.handleException()` 在兜底前**递归解包 cause 链**, 找到原始 BusinessException 就按业务异常返:
+
+```java
+@ExceptionHandler(Exception.class)
+public Result<Void> handleException(Exception e) {
+    // G6 修复: Seata AOP 切面把 BusinessException 包装成 RuntimeException
+    //   (堆栈见 io.seata.spring.annotation.AdapterInvocationWrapper.proceed)
+    // 兜底前解包 cause 链, 找到原始 BusinessException 就按业务异常返
+    Throwable cause = e;
+    while (cause != null) {
+        if (cause instanceof BusinessException be) {
+            log.warn("[业务异常-解包] 错误码={}, 消息={}", be.getCode(), be.getMessage());
+            return Result.error(be.getCode(), be.getMessage());
+        }
+        cause = cause.getCause();
+    }
+    log.error("[系统异常]", e);
+    return Result.error(500, "系统繁忙，请稍后再试");
+}
+```
+
+### 教训
+- 引入 AOP / 代理框架 (Seata / Spring AOP / CGLIB) 都要警惕**异常被重新包装**.
+- 全局异常处理器要做**好兜底**, 不能只信任直接类型匹配.
+- 这个修复**自动惠及之前所有用 @GlobalTransactional 的方法**, 不只是 G6.
+
+### 简历可讲法
+"Seata 全局事务切面会包装业务异常导致 GlobalExceptionHandler 错走兜底分支. 通过给 handleException 加 cause 链解包逻辑修复, 一行 instanceof 模式匹配 (Java 17 语法) 解决了一类潜在 bug."
+
+## 72.2  坑 ② Controller 路径前缀重复
+
+### 症状
+
+写新端点时, 习惯性写完整路径:
+```java
+@PutMapping("/order/{orderId}/ship")
+```
+
+启动后调 `PUT /order/11/ship` → 404 找不到.
+
+### 根因
+
+类上已经 `@RequestMapping("/order")`. Spring 拼接 → 实际路径变成 `/order/order/{orderId}/ship`. 调 `/order/11/ship` 自然找不到.
+
+### 修复
+
+方法上只写相对路径:
+```java
+@PutMapping("/{orderId}/ship")
+```
+
+### 教训
+看一眼类上的 `@RequestMapping`, 方法上是**相对路径**.
+
+## 72.3  坑 ③ @PathVariable / @RequestHeader 用错
+
+### 症状
+
+```java
+public Result<Void> sign(@PathVariable Long useId, @PathVariable Long orderId) {
+```
+
+启动 → Spring 启动报错: "找不到路径参数 useId".
+
+### 根因
+
+- @PathVariable 要求 URL 路径里**有对应占位符**.
+- URL `/{orderId}/sign` 只有 orderId, 没 useId → 找不到.
+- userId 实际上是网关解 JWT 后塞到 HTTP header `X-User-Id` 的, 应该用 @RequestHeader.
+
+### 修复
+
+```java
+public Result<Void> sign(
+        @PathVariable Long orderId,
+        @RequestHeader("X-User-Id") Long userId    // ← header 而不是 path
+) {
+```
+
+### 教训
+- 路径参数 (URL 里的 `{xxx}`) → @PathVariable
+- HTTP header → @RequestHeader
+- 请求 body JSON → @RequestBody
+- 查询字符串 `?key=val` → @RequestParam
+
+## 72.4  坑 ④ Java 8 path 干扰 (重复出现)
+
+### 症状
+
+启动 jar 报 exit 127 "command not found".
+
+### 根因
+
+Windows PATH 里 `C:\Program Files (x86)\Common Files\Oracle\Java\java8path\java.exe` 排在前面, 但这是 Java 8 (Spring Boot 3 要 17+). 而且这个目录有时候只有一个壳, 实际 java.exe 不存在.
+
+### 修复
+
+用绝对路径启动:
+```powershell
+Start-Process -FilePath "D:\jdk-21.0.11\bin\java.exe" -ArgumentList "-jar", "x.jar"
+```
+
+### 教训
+- Windows 多 JDK 环境很常见, PATH 顺序坑大.
+- 启动脚本里强制写绝对路径或先设 JAVA_HOME.
+- Bash 子环境可能继承不到完整 PATH, 用 PowerShell 启动更可靠.
+
+## 72.5  G6 端到端验证完整记录
+
+```
+0. 数据准备
+   订单 id=11, user_id=1(alice), status=1(PAID), logistics 全空
+
+1. Step1 PUT /order/11/ship  body={"logisticsCompany":"SF","logisticsNo":"SF1234567890"}
+   → 200
+   DB: status=2, logistics_no=SF1234567890, logistics_company=SF, ship_time=now
+
+2. Step2 GET /order/11
+   → status=2, logisticsNo=SF1234567890, logisticsCompany=SF, shipTime=2026-06-21T04:27:47
+
+3. Step3 PUT /order/11/sign
+   → 200
+   DB: status=3, finish_time=now
+
+4. Step4 GET /order/11
+   → status=3, finishTime=2026-06-21T04:28:33
+
+5. 边界 1: 重复 ship (此时 status=3)
+   → 400 "订单状态不可发货"  ✅ 状态机拒绝
+
+6. 边界 2: 重复 sign (此时 status=3)
+   → 400 "订单状态不可签收"  ✅ 状态机拒绝
+```
+
+**6 步全过. 状态机 + GlobalExceptionHandler 解包 + Seata 兼容性全部 OK**.
+
+## 72.6  G6 完成后能干啥
+
+- ✅ 状态机的工程实现 (4 步前置校验模板)
+- ✅ Spring @Scheduled 调度 + cron 表达式
+- ✅ MQ 延迟队列 vs @Scheduled 选型 (业务核心能力)
+- ✅ 单机调度的局限 + 3 种分布式调度方案对比
+- ✅ Seata + 全局异常处理器的兼容性陷阱及修复方法
+- ✅ BeanUtils.copyProperties 字段名匹配的自动拷贝能力
+- ✅ DTO + @Valid + @NotBlank 校验闭环
+
+## 72.7  G6 决策沉淀
+
+| 决策 | 选什么 | 为啥 |
+|------|--------|------|
+| 物流表结构 | 加 2 列, 不独立表 | N=1, 符合 feedback_concrete_first |
+| 物流查询 | 走详情接口, 不单独端点 | 业务能复用就复用, 别为对称造端点 |
+| 7 天签收方案 | @Scheduled, 不 MQ | 长延迟 + 不精准 |
+| 状态机 | 4 步前置校验, 不 Spring StateMachine | 状态规模小不需要 |
+| 单机调度 | 暂用单机, 注释 TODO | 当前 1 实例没必要分布式 |
+| BusinessException 解包 | 兜底 handler 递归 cause | 通用方案, 自动惠及所有 @GlobalTransactional |
+
+## 72.8  G6 没做但已铺路的 (后续阶段补)
+
+| 待办 | 啥时候做 | 怎么做 |
+|------|---------|--------|
+| admin 网关 + RBAC | G10 后台 | shipOrder 端点应该挂 admin 后面 + 角色鉴权 |
+| 分布式锁定时任务 | order 多实例时 | LogisticsScheduledTask 第一步 SETNX Redis 锁 |
+| 物流轨迹查询 | 真接物流公司 | 接顺丰/中通 API 拉轨迹, 现在物流公司只是字符串 |
+| 用户端倒计时 UI | 前端 | shipTime 给前端, 计算 "还剩 X 天自动签收" |
+
+## 72.9  累计 G6 关键文件
+
+```
+DB:
+  orders.logistics_no  VARCHAR(64) NULL
+  orders.logistics_company VARCHAR(32) NULL
+
+新建文件:
+  mini-mall-order/src/main/java/com/minimall/order/dto/ShipOrderDTO.java
+  mini-mall-order/src/main/java/com/minimall/order/task/LogisticsScheduledTask.java
+
+修改文件:
+  mini-mall-order/.../entity/Orders.java                  (+2 字段)
+  mini-mall-order/.../vo/OrderDetailVO.java               (+2 字段)
+  mini-mall-order/.../service/IOrdersService.java         (+2 方法)
+  mini-mall-order/.../service/impl/OrdersServiceImpl.java (+2 方法实现)
+  mini-mall-order/.../controller/OrdersController.java    (+2 端点)
+  mini-mall-order/.../MiniMallOrderApplication.java       (+@EnableScheduling)
+  mini-mall-common-core/.../exception/GlobalExceptionHandler.java (cause 链解包)
+```
+
+---
+
+**G6 完毕**. 微服务从 "下单/付款/取消" 走到 "**完整下单全链路 + 状态机 + 定时任务**". 下一步可选: G7 评价, G8 优惠券, G9 ES 商品搜索, G10 后台管理.

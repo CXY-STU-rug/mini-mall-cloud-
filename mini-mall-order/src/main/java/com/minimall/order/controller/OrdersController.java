@@ -2,9 +2,12 @@ package com.minimall.order.controller;
 
 import com.minimall.common.core.domain.Result;
 import com.minimall.order.dto.CreateOrderDTO;
+import com.minimall.order.dto.ShipOrderDTO;
 import com.minimall.order.service.IOrdersService;
 import com.minimall.order.vo.OrderDetailVO;
 import com.minimall.order.vo.OrderListVO;
+import com.rabbitmq.client.Return;
+import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
@@ -72,5 +75,42 @@ public class OrdersController {
     ) {
         ordersService.payOrder(userId, orderId);
         return Result.success();
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // G6 物流: 2 个新端点 TODO 用户写
+    //
+    // ⑥ 发货 (admin)
+    //   - PUT /order/{orderId}/ship
+    //   - @PathVariable Long orderId
+    //   - @RequestBody @Valid ShipOrderDTO dto    ← 加 @Valid 才会触发 @NotBlank
+    //   - ❌ 不要 @RequestHeader("X-User-Id"), admin 操作不需要用户身份
+    //   - 调 ordersService.shipOrder(orderId, dto)
+    //   - 返 Result.success()
+    //
+    // ⑦ 签收 (用户)
+    //   - PUT /order/{orderId}/sign
+    //   - 完全照搬 cancel 端点改个方法名就行
+    //   - 调   ordersService.signOrder(userId, orderId);
+    //      return Result.success();
+    // ─────────────────────────────────────────────────────────────
+
+    /** ⑥ 发货 (admin) - TODO 用户实现 G6.5 */
+    @PutMapping("/{orderId}/ship")
+    public Result<Void> ship(@PathVariable Long orderId,@RequestBody @Valid ShipOrderDTO dto )
+    {
+
+        ordersService.shipOrder(orderId, dto);
+        return Result.success();
+    }
+
+    /** ⑦ 签收 (用户) - TODO 用户实现 G6.5 */
+
+
+    @PutMapping("/{orderId}/sign")
+    public Result<Void> sign( @RequestHeader("X-User-Id") Long userId,@PathVariable Long orderId)
+    {  ordersService.signOrder(userId, orderId);
+        return Result.success();
+
     }
 }

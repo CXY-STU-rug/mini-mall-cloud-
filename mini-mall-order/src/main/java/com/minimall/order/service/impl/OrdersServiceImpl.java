@@ -10,6 +10,7 @@ import com.minimall.order.client.UserFeignClient;
 import com.minimall.order.config.RabbitMQConfig;
 import com.minimall.order.constant.OrderStatus;
 import com.minimall.order.dto.CreateOrderDTO;
+import com.minimall.order.dto.ShipOrderDTO;
 import com.minimall.order.entity.CartItem;
 import com.minimall.order.entity.OrderItem;
 import com.minimall.order.entity.Orders;
@@ -465,4 +466,79 @@ public class OrdersServiceImpl extends ServiceImpl<OrdersMapper, Orders> impleme
             productFeignClient.restoreStock(item.getProductId(), item.getQuantity());
         }
     }
+
+    // ════════════════════════════════════════════════════════════
+    // ⑦ G6 物流: 发货 (管理员调用)
+    // ════════════════════════════════════════════════════════════
+    @Override
+    public void shipOrder(Long orderId, ShipOrderDTO dto) {
+        // ─────────────────────────────────────────────────────────
+        // TODO 用户填: 状态机 4 步模板 (参考 cancelOrder 行 380~390)
+        //
+        //   第 1 步: 查订单, 为空抛 BusinessException(404, "订单不存在")
+        Orders order = ordersMapper.selectById(orderId);
+        if (order == null) throw new BusinessException(404, "订单不存在");
+        //   第 2 步: 跳过 user_id 校验 (admin 不需要)
+        //   第 3 步: 状态机前置 — 必须 == OrderStatus.PAID (=1)
+        //            否则抛 BusinessException(400, "订单状态不可发货")
+        if (!order.getStatus().equals(OrderStatus.PAID)) {
+            throw new BusinessException(400, "订单状态不可发货");
+        }
+
+        //   第 4 步: setStatus(OrderStatus.SHIPPED) + setShipTime(now)
+        //            + setLogisticsCompany(dto.getLogisticsCompany())
+        //            + setLogisticsNo(dto.getLogisticsNo())
+        //            最后 ordersMapper.updateById(order);
+        //
+        // 提示: now 用 LocalDateTime.now()
+        //       OrderStatus.SHIPPED 是已定义的常量 (=2)
+        // ─────────────────────────────────────────────────────────
+        order.setStatus(OrderStatus.SHIPPED);
+        order.setShipTime(LocalDateTime.now());
+        order.setLogisticsCompany(dto.getLogisticsCompany());
+        order.setLogisticsNo(dto.getLogisticsNo());
+        ordersMapper.updateById(order);
+
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // ⑧ G6 物流: 签收 (用户主动)
+    // ════════════════════════════════════════════════════════════
+    @Override
+    public void signOrder(Long userId, Long orderId) {
+        // ─────────────────────────────────────────────────────────
+        // TODO 用户填: 状态机 4 步模板 (参考 cancelOrder)
+        //
+        //   第 1 步: 查订单, 为空抛 BusinessException(404, "订单不存在")
+
+        //   第 2 步: 越权校验 — order.getUserId().equals(userId)
+        //            不匹配抛 BusinessException(403, "无权操作")
+
+        //   第 3 步: 状态机前置 — 必须 == OrderStatus.SHIPPED (=2)
+        //            否则抛 BusinessException(400, "订单状态不可签收")
+
+        //   第 4 步: setStatus(OrderStatus.COMPLETED) + setFinishTime(now)
+        //            ordersMapper.updateById(order);
+        //
+        // 提示: OrderStatus.COMPLETED 是已定义的常量 (=3)
+        // ─────────────────────────────────────────────────────────
+        Orders order = ordersMapper.selectById(orderId);
+        if (order == null) throw new BusinessException(404, "订单不存在");
+
+        // 第 2 步: 越权校验 (用户类操作必须做!)
+        if (!order.getUserId().equals(userId)) {
+            throw new BusinessException(403, "无权操作");
+        }
+
+        // 第 3 步: 状态机前置 — 必须 SHIPPED 才能签收
+        if (!order.getStatus().equals(OrderStatus.SHIPPED)) {
+            throw new BusinessException(400, "订单状态不可签收");
+        }
+
+        // 第 4 步: 改状态 + 填签收时间
+        order.setStatus(OrderStatus.COMPLETED);
+        order.setFinishTime(LocalDateTime.now());
+        ordersMapper.updateById(order);
+    }
 }
+

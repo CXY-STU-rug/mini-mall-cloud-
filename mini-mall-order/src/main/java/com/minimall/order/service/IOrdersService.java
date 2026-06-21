@@ -2,6 +2,7 @@ package com.minimall.order.service;
 
 import com.baomidou.mybatisplus.extension.service.IService;
 import com.minimall.order.dto.CreateOrderDTO;
+import com.minimall.order.dto.ShipOrderDTO;
 import com.minimall.order.entity.Orders;
 import com.minimall.order.vo.OrderDetailVO;
 import com.minimall.order.vo.OrderListVO;
@@ -45,4 +46,28 @@ public interface IOrdersService extends IService<Orders> {
      * 关键: 必须【幂等】, 消息可能重复投递
      */
     void closeOrderByMQ(Long orderId);
+
+    // ─── G6 物流: 状态机推进 ─────────────────────────────────
+    // 状态流转: 1 已付款 ──ship──> 2 已发货 ──sign──> 3 已完成
+    // ─────────────────────────────────────────────────────────
+
+    /**
+     * 发货 (管理员/仓库系统调用, 无 userId)
+     *
+     * 状态机前置: status 必须 = 1 (已付款), 否则拒绝
+     * 副作用: status 改 2, 填 shipTime + logisticsNo + logisticsCompany
+     *
+     * ⚠ TODO 安全: 当前无 admin 网关守护, 普通用户能调到这个接口.
+     *    真生产环境必须挂在 admin 路径下 + RBAC 鉴权 (G10 admin 模块补)
+     */
+    void shipOrder(Long orderId, ShipOrderDTO dto);
+
+    /**
+     * 签收 (用户主动确认收货)
+     *
+     * 状态机前置: status 必须 = 2 (已发货), 否则拒绝
+     * 副作用: status 改 3, 填 finishTime
+     * 越权防护: orders.user_id 必须 = 入参 userId, 否则拒绝
+     */
+    void signOrder(Long userId, Long orderId);
 }

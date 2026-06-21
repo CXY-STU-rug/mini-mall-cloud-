@@ -27,5 +27,9 @@ public class OrderDetailVO {
     private LocalDateTime shipTime;  // ← 详情多
     private LocalDateTime finishTime;// ← 详情多
     private LocalDateTime createTime;
+    // ─── G6 物流字段 (status>=2 时有值, 之前为 null) ────
+    private String logisticsNo;
+    private String logisticsCompany;
+    // ───────────────────────────────────────────────────
     private List<OrderItemVO> items;
 }

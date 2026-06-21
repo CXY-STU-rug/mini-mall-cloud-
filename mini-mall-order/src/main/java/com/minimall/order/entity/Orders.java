@@ -65,6 +65,17 @@ public class Orders implements Serializable {
     /** 完成时间 (status=3 时填) */
     private LocalDateTime finishTime;
 
+    // ─── G6 物流字段 ─────────────────────────────────────────
+    // 设计选择: 直接给 orders 表加 2 列 (而不是独立 logistics 表)
+    // 理由: 当前 N=1 物流场景, 没必要拆表; 等真出现"多承运商/转运/跨境拆单"再独立
+    // MP 映射: DB logistics_no → Java logisticsNo (yml 开了 map-underscore-to-camel-case)
+    /** 物流单号 (status=2 发货时填) */
+    private String logisticsNo;
+
+    /** 物流公司 (status=2 发货时填, 例: 顺丰 / 中通 / 京东) */
+    private String logisticsCompany;
+    // ─────────────────────────────────────────────────────────
+
     /** 备注 (用户填的下单备注) */
     private String remark;
 

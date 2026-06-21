@@ -93,6 +93,17 @@ public class GlobalExceptionHandler {
      */
     @ExceptionHandler(Exception.class)
     public Result<Void> handleException(Exception e) {
+        // G6 修复: Seata AOP 切面把 BusinessException 包装成 RuntimeException
+        //   (堆栈见 io.seata.spring.annotation.AdapterInvocationWrapper.proceed)
+        // 兜底前解包 cause 链, 找到原始 BusinessException 就按业务异常返
+        Throwable cause = e;
+        while (cause != null) {
+            if (cause instanceof BusinessException be) {
+                log.warn("[业务异常-解包] 错误码={}, 消息={}", be.getCode(), be.getMessage());
+                return Result.error(be.getCode(), be.getMessage());
+            }
+            cause = cause.getCause();
+        }
         log.error("[系统异常]", e);
         return Result.error(500, "系统繁忙，请稍后再试");
     }
