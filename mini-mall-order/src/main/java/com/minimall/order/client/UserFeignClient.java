@@ -26,7 +26,10 @@ import java.util.Map;
  *   现在用显式参数, 简单直接, 等出现 3+ 个 Feign Client 都需要传同样 header 再抽.
  * ════════════════════════════════════════════════════════════════
  */
-@FeignClient(name = "mini-mall-user")
+@FeignClient(
+        name = "mini-mall-user",
+        fallback = com.minimall.order.client.fallback.UserFeignClientFallback.class
+)
 public interface UserFeignClient {
 
     /**

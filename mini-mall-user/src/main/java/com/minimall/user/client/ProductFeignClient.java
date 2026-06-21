@@ -31,7 +31,10 @@ import java.util.Map;
  *      简单方案: 用 Map 接, 业务代码自己 get("data") 拿字段
  *      正经方案: 抽 mini-mall-product-api 模块只放 DTO 共用(以后做)
  */
-@FeignClient(name = "mini-mall-product")
+@FeignClient(
+        name = "mini-mall-product",
+        fallback = com.minimall.user.client.fallback.ProductFeignClientFallback.class
+)
 public interface ProductFeignClient {
 
     /**

@@ -39,6 +39,11 @@ spring:
     username: root
     password: YOUR_MYSQL_PASSWORD   # ⭐ 改这里
 
+# ─── H1: Feign 接入 Sentinel 让 @FeignClient(fallback=) 生效 ─
+feign:
+  sentinel:
+    enabled: true
+
 # ═══════════════════════════════════════════════════════════
 # MyBatis-Plus 配置
 # ═══════════════════════════════════════════════════════════
