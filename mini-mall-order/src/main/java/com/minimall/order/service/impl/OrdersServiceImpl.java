@@ -39,7 +39,7 @@ import java.util.Map;
 import java.util.Random;
 
 /**
- * 订单服务实现 (G3.7 - 微服务版, 简化版不扣库存)
+ * 订单服务实现 (G3.7 搬迁 + G3.10 补扣库存 + H1 Feign fallback)
  *
  * ════════════════════════════════════════════════════════════════
  * vs 单体差异:
@@ -47,17 +47,19 @@ import java.util.Random;
  *   ② addressService.getById  → userFeignClient.getAddress  (HTTP)
  *   ③ productService.listByIds → 循环 productFeignClient.getById (HTTP × N)
  *      性能差但教学简单, 生产应给 product 加 batch 接口
- *   ④ productMapper.deductStock / restoreStock 全部去掉
- *      = 简化版【不扣库存】, 后续 G4 上分布式事务再补
+ *   ④ 扣/回库存改成 Feign 跨服务调用 productFeignClient.deductStock / restoreStock
+ *      ⚠ 跨服务事务局限: order 抛异常时 product 已扣的库存不会自动回滚
+ *        (分布式事务问题, 等 Seata/MQ 补偿表解)
  *   ⑤ 商品/地址数据 Map<String, Object>, 因为 order 引不到 Product/Address entity
+ *   ⑥ H1: 3 个 Feign Client 都有 fallback, product/user 挂了走兜底
  *
  * 6 个方法分布:
- *   createOrder        ★ 最复杂, 7 步 + 锁 + 事务 + 事务外发 MQ
+ *   createOrder        ★ 最复杂, 8 步 + 锁 + 事务 + 事务外发 MQ + 跨服务扣库存
  *   listMyOrders       中等, 批量查 + Map 分组
  *   getOrderDetail     简单
- *   cancelOrder        中等, 锁 + 事务 + 状态机
- *   payOrder           中等, 同 cancel 套路
- *   closeOrderByMQ     简单 + 幂等, 没用户上下文
+ *   cancelOrder        中等, 锁 + 事务 + 状态机 + 回库存
+ *   payOrder           中等, 同 cancel 套路 (但不回库存)
+ *   closeOrderByMQ     简单 + 幂等, 没用户上下文 + 回库存
  * ════════════════════════════════════════════════════════════════
  */
 @Service
