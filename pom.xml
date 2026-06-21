@@ -91,6 +91,12 @@
                 <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
                 <version>${mybatis-plus.version}</version>
             </dependency>
+            <!-- ③.1 MP 3.5.9+ 把 PaginationInnerInterceptor 拆到了 jsqlparser 包 -->
+            <dependency>
+                <groupId>com.baomidou</groupId>
+                <artifactId>mybatis-plus-jsqlparser</artifactId>
+                <version>${mybatis-plus.version}</version>
+            </dependency>
 
             <!-- ④ JWT 三件套 -->
             <dependency>

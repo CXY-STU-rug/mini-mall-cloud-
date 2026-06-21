@@ -30,6 +30,11 @@
             <groupId>com.baomidou</groupId>
             <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
         </dependency>
+        <!-- G3.9: 分页拦截器 PaginationInnerInterceptor 在 3.5.9+ 移到了这个包 -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-jsqlparser</artifactId>
+        </dependency>
 
         <dependency>
             <groupId>com.mysql</groupId>

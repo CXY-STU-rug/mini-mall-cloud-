@@ -2,25 +2,30 @@ package com.minimall.product.controller;
 
 import com.alibaba.csp.sentinel.annotation.SentinelResource;
 import com.alibaba.csp.sentinel.slots.block.BlockException;
+import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.minimall.common.core.domain.Result;
 import com.minimall.common.core.exception.BusinessException;
 import com.minimall.product.entity.Product;
 import com.minimall.product.service.IProductService;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
+import java.math.BigDecimal;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * 商品控制器
+ * 商品 Controller (G3.9 补齐: 单体 6 端点 + flaky 演示)
  *
- * 2 个接口：
- *   GET /product/{id}   → 按 id 查商品（会被 Feign 调用）
- *   GET /product        → 查商品列表（前 10 条）
+ * 端点清单:
+ *   GET    /product?page=&size=&categoryId=&keyword=&minPrice=&maxPrice=  分页搜索
+ *   GET    /product/{id}                  详情(带 Redis 缓存)
+ *   POST   /product                       新建
+ *   PUT    /product/{id}                  改 + 删缓存
+ *   DELETE /product/{id}                  删 + 删缓存
+ *   GET    /product/hot-search            热搜 Top 10
+ *   GET    /product/flaky                 Sentinel 熔断演示(F2 保留)
  */
 @RestController
 @RequestMapping("/product")
@@ -29,61 +34,71 @@ public class ProductController {
     @Autowired
     private IProductService productService;
 
-    /** 按 id 查商品 */
+    /** ① 分页搜索 + 多条件筛选 */
+    @GetMapping
+    public Result<IPage<Product>> list(
+            @RequestParam(defaultValue = "1")  Integer page,
+            @RequestParam(defaultValue = "10") Integer size,
+            @RequestParam(required = false) Long categoryId,
+            @RequestParam(required = false) String keyword,
+            @RequestParam(required = false) BigDecimal minPrice,
+            @RequestParam(required = false) BigDecimal maxPrice
+    ) {
+        return Result.success(
+                productService.searchProducts(page, size, categoryId, keyword, minPrice, maxPrice)
+        );
+    }
+
+    /** ② 详情(走 Redis 缓存) */
     @GetMapping("/{id}")
-    public Result<Product> getById(@PathVariable("id") Long id) {
-        Product product = productService.getById(id);   // 白嫖自 ServiceImpl
+    public Result<Product> detail(@PathVariable("id") Long id) {
+        Product product = productService.getProductDetail(id);
         if (product == null) {
             throw new BusinessException("商品不存在");
         }
         return Result.success(product);
     }
 
-    /** 查商品列表（前 10 条） */
-    @GetMapping
-    public Result<List<Product>> list() {
-        List<Product> products = productService.list();
-        return Result.success(products.subList(0, Math.min(10, products.size())));
+    /** ③ 新建(白嫖 IService.save) */
+    @PostMapping
+    public Result<Product> create(@RequestBody Product product) {
+        productService.save(product);
+        return Result.success(product);
+    }
+
+    /** ④ 修改 + 自动失效缓存 */
+    @PutMapping("/{id}")
+    public Result<Product> update(@PathVariable Long id, @RequestBody Product product) {
+        product.setId(id);
+        productService.updateProduct(product);
+        return Result.success(product);
+    }
+
+    /** ⑤ 删除(逻辑删) + 失效缓存 */
+    @DeleteMapping("/{id}")
+    public Result<Void> delete(@PathVariable Long id) {
+        productService.deleteProduct(id);
+        return Result.success();
+    }
+
+    /** ⑥ 热搜 Top 10 */
+    @GetMapping("/hot-search")
+    public Result<List<Map<String, Object>>> hotSearch() {
+        return Result.success(productService.getHotSearch(10));
     }
 
     // ════════════════════════════════════════════════════════════════
-    // F2.6 演示接口: 异常比例熔断
+    // F2.6 Sentinel 熔断演示(保留)
     // ════════════════════════════════════════════════════════════════
-
-    /**
-     * 不稳定接口 (30% 概率抛业务异常)
-     *
-     * 用来演示 Sentinel 熔断:
-     *   ① 没规则时: 30% 请求失败, 70% 成功
-     *   ② 配 DegradeRule(异常率 50%, minRequestAmount 5, timeWindow 10s):
-     *       a) 1 秒内 < 5 个请求 → 不统计, 不熔断
-     *       b) 1 秒内 ≥ 5 个请求, 异常率 ≥ 50% → 熔断 10 秒
-     *       c) 熔断期间所有请求直接 DegradeException → blockHandler 兜底
-     *       d) 10 秒后 HALF-OPEN, 放 1 个试探, 成功就 CLOSED, 失败回 OPEN
-     */
     @GetMapping("/flaky")
-    @SentinelResource(
-            value = "flakyResource",
-            blockHandler = "flakyBlock"
-            // 不写 fallback: 业务异常正常抛, 让 Sentinel 统计为"异常"
-    )
+    @SentinelResource(value = "flakyResource", blockHandler = "flakyBlock")
     public Result<String> flaky() {
-        // 30% 抛业务异常 (会被 Sentinel 计入 exceptionQps)
         if (ThreadLocalRandom.current().nextInt(100) < 30) {
             throw new BusinessException("flaky 接口随机失败 (模拟下游不稳定)");
         }
         return Result.success("flaky ok");
     }
 
-    /**
-     * flaky 的限流/熔断降级方法
-     *
-     * Sentinel 拦下(熔断打开 / 限流触发)时调这里:
-     *   - DegradeException: 熔断打开
-     *   - FlowException: 限流触发
-     *
-     * 我们返一个 Result.error 友好提示, 不让前端看到 500
-     */
     public Result<String> flakyBlock(BlockException ex) {
         return Result.error(503, "下游服务繁忙, 暂时降级 (触发规则: "
                 + ex.getClass().getSimpleName() + ")");
