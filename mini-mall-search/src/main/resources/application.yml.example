@@ -1,0 +1,39 @@
+# 真实 application.yml 不进 git, 本文件是脱敏样板
+# 用法: cp application.yml.example application.yml
+# search 服务无敏感凭证 (ES 关了安全 + 不连 MySQL), example 跟 yml 内容相同
+
+server:
+  port: 9005
+
+spring:
+  application:
+    name: mini-mall-search
+
+  # ES 配置 (search 独有)
+  elasticsearch:
+    uris: http://127.0.0.1:9200
+    connection-timeout: 1s
+    socket-timeout: 30s
+
+  cloud:
+    # Nacos 服务发现
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+    # Sentinel 限流熔断
+    sentinel:
+      transport:
+        dashboard: 127.0.0.1:8858
+        port: 8724
+      eager: true
+
+# Feign 接入 Sentinel, 让 fallback 真生效
+feign:
+  sentinel:
+    enabled: true
+
+logging:
+  level:
+    com.minimall: debug
+    root: info

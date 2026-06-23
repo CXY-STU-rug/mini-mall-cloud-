@@ -48,9 +48,12 @@
                ② RedisAutoConfiguration (读 spring.data.redis.* 自动配 RedisTemplate)
                ③ StringRedisTemplate (专门处理 String, 不用我们手配)
              不引版本号, Boot BOM 已锁 -->
+        <!-- ⭐ N=3 抽出 (common-redis): 替代直接引 spring-boot-starter-data-redis
+             自动获得: RedisTemplate Bean (含 JSON 序列化 + JavaTimeModule) + RedisService 工具 -->
         <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-redis</artifactId>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-redis</artifactId>
+            <version>0.0.1-SNAPSHOT</version>
         </dependency>
 
         <!-- ⭐ G3.4 新增: MyBatis-Plus (CartItem 存 cart_item 表)

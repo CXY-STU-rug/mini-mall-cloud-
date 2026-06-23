@@ -11015,3 +11015,894 @@ order 服务改:
 ---
 
 **G8 完毕**. 微服务从 "评价闭环" 走到 "**完整电商核心: 用户/商品/订单/库存/物流/评价/优惠券 + 跨服务事务 + CAS 乐观锁**". 后续可选: G9 ES 商品搜索, G10 后台管理, 或 C1 README + C2 GitHub 改名收尾.
+
+
+# 75. G9 - ES 商品搜索服务 (mini-mall-search)
+
+> 端口 9005, 服务名 `mini-mall-search`. 从 0 建一个新微服务模块, 把 product 数据灌进 ES 给前端搜.
+
+## 75.0 总览 - G9 干了啥
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                       前端浏览器                            │
+│           GET /search/product?keyword=华为                  │
+└────────────────────┬───────────────────────────────────────┘
+                     ▼
+            ┌────────────────┐
+            │  网关 :9000    │  lb:// → Nacos 负载均衡
+            │  Path=/search/**│
+            └───────┬────────┘
+                    ▼
+      ┌────────────────────────────────┐
+      │  mini-mall-search :9005        │ ← G9 主角
+      │  Controller → Service → 2 出口 │
+      └─┬──────────────────────────┬───┘
+        │                          │
+   Feign 调 product           Spring Data ES
+        ▼                          ▼
+  product :9002               ES :9200
+  /internal/all               索引 mini_mall_product
+```
+
+**数据流向 (全量同步)**:
+```
+MySQL → product JSON → 网络 → Jackson 反序列化 ProductSource
+  → .map(ProductDocument::from) → repository.saveAll() → ES
+```
+
+**最大收获**:
+1. **微服务铁律** — 服务间**不共享 jar**, 各自写 DTO 副本 (ProductSource), Jackson 按字段名匹配反序列化
+2. **静态工厂方法 from()** — 在目标类里写转换, `stream().map(类::from)` 优雅链式转换
+3. **Spring Data ES = 'ES 版的 MyBatis-Plus'** — 1 行接口自动获得 20+ CRUD 方法
+4. **BoolQuery 灵魂** — `must` 打分(关键词搜) vs `filter` 不打分有缓存(精确过滤)
+5. **改代码必须重新打包** — IDE 改的是源码, fat jar 不会自动同步 (G9 真实排坑)
+
+## 75.1 mini-mall-search 模块脚手架
+
+### 75.1.1 pom.xml (4 个依赖 + maven plugin)
+
+```xml
+<parent>
+    <groupId>com.minimall</groupId>
+    <artifactId>mini-mall-cloud</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+</parent>
+<artifactId>mini-mall-search</artifactId>
+
+<dependencies>
+    <!-- Result/GlobalExceptionHandler -->
+    <dependency>
+        <groupId>com.minimall</groupId>
+        <artifactId>mini-mall-common-core</artifactId>
+    </dependency>
+    <!-- 对外 HTTP -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <!-- ⭐ ES 8.x 客户端 + Spring Data Repository -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-elasticsearch</artifactId>
+    </dependency>
+    <!-- 跨服务 Feign -->
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-openfeign</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+
+<build>
+    <plugins>
+        <plugin>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-maven-plugin</artifactId>
+        </plugin>
+    </plugins>
+</build>
+```
+
+**知识点**:
+- ⭐ `spring-boot-starter-data-elasticsearch` 内部用 **ES 8.x 新版 Java API Client** (`co.elastic.clients`), 不再用老的 RestHighLevelClient
+- `<optional>true</optional>` 让 lombok 只编译期可见, 不传递
+
+### 75.1.2 父 pom 解开模块注释
+
+```xml
+<modules>
+    ...
+    <module>mini-mall-search</module>   <!-- 解开这一行 -->
+</modules>
+```
+
+**坑**: 不加这行 `mvn install` 不会编译这个子模块, IDE 能识别但命令行编译跳过.
+
+### 75.1.3 application.yml
+
+```yaml
+server:
+  port: 9005
+
+spring:
+  application:
+    name: mini-mall-search
+  elasticsearch:
+    uris: http://127.0.0.1:9200
+    connection-timeout: 1s
+    socket-timeout: 30s
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+    sentinel:
+      transport:
+        dashboard: 127.0.0.1:8858
+        port: 8724      # ⭐ 跟 product/order/user 错开
+```
+
+### 75.1.4 启动类
+
+```java
+@SpringBootApplication
+@EnableFeignClients
+@ComponentScan("com.minimall")    // ⭐ 扩大扫描范围, 扫到 common-core
+public class MiniMallSearchApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(MiniMallSearchApplication.class, args);
+        System.out.println("=========== mini-mall-search 已启动 :9005 ===========");
+    }
+}
+```
+
+**坑**: IDE 自动 import 可能给你 `import javax.swing.*`, 看到 `javax.swing` 立马删. ⚠
+
+## 75.2 ProductDocument - ES 索引映射类
+
+### 75.2.1 ES 核心概念速查
+
+| 概念 | 含义 | 类比 MySQL |
+|---|---|---|
+| Document | 一条 JSON 数据 | 一行 row |
+| Index | 同类文档集合 | 一张 table |
+| 倒排索引 | "词 → 文档列表" 反向映射 | (相当于全文索引但更强) |
+| 分词器 Analyzer | 把 Text 字段拆成词 token | (MySQL 没有) |
+
+### 75.2.2 ⭐ Field Type 选择 (G9 最重要知识点)
+
+| FieldType | 用途 | 是否分词 | 用例 |
+|---|---|---|---|
+| **Text** | 全文搜索 | ✅ 分词 | name/description/detail |
+| **Keyword** | 精确匹配 | ❌ 不分词 | tag/code/URL/枚举字符串 |
+| **Long** | 整数主键/ID | — | id/categoryId |
+| **Integer** | 小整数 | — | stock/sales/reviewCount |
+| **Double** | 小数 (BigDecimal 也用它) | — | price/avgRating |
+| **Date** | 时间 | — | createTime/updateTime |
+
+**口诀**: '要搜索的文本用 Text, 要精确匹配的字符串用 Keyword, 数值就用对应数值类型.'
+
+### 75.2.3 ProductDocument.java (含静态工厂方法)
+
+```java
+@Data
+@Document(indexName = "mini_mall_product")
+public class ProductDocument {
+
+    @Id                                  // ES 的 _id 主键
+    private Long id;
+
+    @Field(type = FieldType.Text)        // 要搜, 分词
+    private String name;
+    @Field(type = FieldType.Long)
+    private Long categoryId;
+    @Field(type = FieldType.Text)
+    private String description;
+    @Field(type = FieldType.Text)
+    private String detail;
+    @Field(type = FieldType.Double)      // BigDecimal 用 Double 映射
+    private BigDecimal price;
+    @Field(type = FieldType.Integer)
+    private Integer stock;
+    @Field(type = FieldType.Integer)
+    private Integer sales;
+    @Field(type = FieldType.Double)
+    private BigDecimal avgRating;
+    @Field(type = FieldType.Integer)
+    private Integer reviewCount;
+    @Field(type = FieldType.Keyword)     // URL 不分词
+    private String coverImage;
+    @Field(type = FieldType.Integer)
+    private Byte status;
+    @Field(type = FieldType.Date, format = DateFormat.date_hour_minute_second)
+    private LocalDateTime createTime;
+    @Field(type = FieldType.Date, format = DateFormat.date_hour_minute_second)
+    private LocalDateTime updateTime;
+
+    // ⭐ 静态工厂方法: ProductSource → ProductDocument
+    public static ProductDocument from(ProductSource src) {
+        ProductDocument doc = new ProductDocument();
+        doc.setId(src.getId());
+        doc.setName(src.getName());
+        doc.setCategoryId(src.getCategoryId());
+        doc.setDescription(src.getDescription());
+        doc.setDetail(src.getDetail());
+        doc.setPrice(src.getPrice());
+        doc.setStock(src.getStock());
+        doc.setSales(src.getSales());
+        doc.setAvgRating(src.getAvgRating());
+        doc.setReviewCount(src.getReviewCount());
+        doc.setCoverImage(src.getCoverImage());
+        doc.setStatus(src.getStatus());
+        doc.setCreateTime(src.getCreateTime());
+        doc.setUpdateTime(src.getUpdateTime());
+        return doc;
+    }
+}
+```
+
+**关键注解**:
+- `@Document(indexName="...")` 类级别, 声明映射到 ES 哪个索引. 索引名规范: 全小写 + 下划线
+- `@Id` 主键 → ES 的 `_id`. save 时 ES 用它判断新增 or 覆盖
+- `@Field(type=...)` 显式声明类型. 不写 ES 自动推断成 Text+Keyword 双字段, 占空间不可控
+- `DateFormat.date_hour_minute_second` 对应 `yyyy-MM-dd'T'HH:mm:ss`, 跟 LocalDateTime 序列化匹配
+
+## 75.3 DTO / VO / 数据载体三剑客
+
+### 75.3.1 ProductSearchRequest (前端搜索条件)
+
+```java
+@Data
+public class ProductSearchRequest {
+    private String keyword;            // 搜 name/description/detail
+    private Long categoryId;
+    private BigDecimal minPrice;
+    private BigDecimal maxPrice;
+    private Integer page;
+    private Integer size;
+    private String sort;               // price_asc/price_desc/sales_desc/rating_desc/newest
+}
+```
+
+**知识点**: Spring MVC 自动把 HTTP query 参数按字段名映射到 DTO, **无需 @RequestParam**. 字段全用包装类, 前端不传时能为 null.
+
+### 75.3.2 ProductSearchVO (返给前端的卡片)
+
+```java
+@Data
+public class ProductSearchVO {
+    private Long id;              // 跳详情
+    private String name;          // 卡片标题
+    private BigDecimal price;     // ¥X,XXX
+    private String coverImage;    // 缩略图
+    private Long categoryId;      // 分类标签
+    private Integer sales;        // 已售
+    private BigDecimal avgRating; // ⭐ 4.8 分
+    private Integer reviewCount;  // (1234 评论)
+
+    // ⭐ 第二次用 from() 套路: ProductDocument → VO
+    public static ProductSearchVO from(ProductDocument doc) {
+        ProductSearchVO vo = new ProductSearchVO();
+        vo.setId(doc.getId());
+        vo.setName(doc.getName());
+        vo.setPrice(doc.getPrice());
+        vo.setCoverImage(doc.getCoverImage());
+        vo.setCategoryId(doc.getCategoryId());
+        vo.setSales(doc.getSales());
+        vo.setAvgRating(doc.getAvgRating());
+        vo.setReviewCount(doc.getReviewCount());
+        return vo;
+    }
+}
+```
+
+**思想**: ProductDocument 14 字段, VO 只取 8 个卡片字段, 不返 description/detail/stock/status/time (详情页才用). **省带宽, 前端代码更清爽**.
+
+### 75.3.3 PageResultVO\<T\> (通用分页结果, 泛型类)
+
+```java
+@Data
+@AllArgsConstructor
+public class PageResultVO<T> {
+    private Long total;     // ES totalHits
+    private Long pages;     // 总页数 = 向上取整(total/size)
+    private Integer page;
+    private Integer size;
+    private List<T> records;
+}
+```
+
+**泛型**: 用 `PageResultVO<ProductSearchVO>` 装商品, `PageResultVO<OrderVO>` 装订单. 一个类多种用途.
+
+## 75.4 ⭐ 微服务铁律 - ProductSource + Feign
+
+### 75.4.1 product 服务暴露 internal 端点 (G9.3.1)
+
+```java
+// Controller 已有 @RequestMapping("/product") 类前缀
+@GetMapping("/internal/all")
+public Result<List<Product>> listAllForSync() {
+    return Result.success(productService.listAllForSync());
+}
+
+// ServiceImpl
+@Override
+public List<Product> listAllForSync() {
+    // ⭐ 只灌"已上架"商品, MP 自动加 is_deleted=0
+    return lambdaQuery().eq(Product::getStatus, (byte) 1).list();
+}
+```
+
+**约定**:
+- `/internal/*` 路径 = 服务间内部接口, 网关可不路由
+- 最终路径 = `/product/internal/all` (类前缀 + 方法路径自动拼接)
+
+### 75.4.2 ⭐ 微服务核心铁律 - 不共享 jar
+
+**search 服务不能 import product 服务的 Product entity**.
+
+为什么:
+- product 和 search 是两个独立的 jar, 不能在 pom 里 `<dependency>` 对方
+- 否则 search 跟 product 强耦合, 改 product 要重发 search → 回到单体痛苦
+- 跨服务调用**只走 HTTP/Feign**, 不走 jar 依赖
+
+**怎么传数据?** Jackson 反序列化**只看字段名, 不看类名**:
+- JSON 里 `"name":"华为"` → 你的 Java 类里有字段 `private String name;` → 自动赋值
+- ProductSource 哪怕改名叫 Foo, 字段名跟 JSON 对得上, 反序列化都成功
+
+### 75.4.3 ProductSource (search 自己写一份)
+
+```java
+// search 服务 entity/ProductSource.java
+@Data
+public class ProductSource {                    // ⭐ 不带任何 ES/MP 注解, 纯 POJO
+    private Long id;
+    private Long categoryId;
+    private String name;
+    private String description;
+    private String detail;
+    private BigDecimal price;
+    private Integer stock;
+    private Integer sales;
+    private BigDecimal avgRating;
+    private Integer reviewCount;
+    private String coverImage;
+    private Byte status;
+    private LocalDateTime createTime;
+    private LocalDateTime updateTime;
+    // ⭐ 14 字段跟 product.Product 完全镜像, 但是独立的类
+}
+```
+
+**早就在 G7 用过同样套路** — review 服务 ReviewStatsVO + product 服务 ReviewStatsVO 各一份. 这是微服务的"DTO 副本模式".
+
+### 75.4.4 ProductFeignClient + Fallback
+
+```java
+// client/ProductFeignClient.java
+@FeignClient(
+    name = "mini-mall-product",
+    fallback = ProductFeignClientFallback.class
+)
+public interface ProductFeignClient {
+    @GetMapping("/product/internal/all")        // ⭐ 完整路径
+    Result<List<ProductSource>> listAllForSync();
+}
+
+// client/ProductFeignClientFallback.java
+@Component
+@Slf4j
+public class ProductFeignClientFallback implements ProductFeignClient {
+    @Override
+    public Result<List<ProductSource>> listAllForSync() {
+        log.warn("[product-feign] listAllForSync 降级, product 服务不通");
+        return Result.error(503, "product 服务降级, 拉商品失败");
+    }
+}
+```
+
+**知识点**:
+- `@FeignClient(name=...)` 走 Nacos 负载均衡, 不写 url
+- Fallback 必须 `@Component` + `implements` 同一接口
+- ⭐ 错误码用 **503 (Service Unavailable)** 比 500 贴切, 降级是"服务不可用"
+- `log.warn` 不用 `log.error`: 降级是预期内失败, 不算 bug, 不必触发告警
+
+## 75.5 Spring Data ES Repository - ES 版的 MyBatis-Plus
+
+### 75.5.1 ProductDocumentRepository
+
+```java
+public interface ProductDocumentRepository
+        extends ElasticsearchRepository<ProductDocument, Long> {
+    // 不需要任何方法! Spring Data 用 JDK 动态代理自动生成实现
+    //
+    // 进阶: 加方法签名 → Spring Data 按命名规则自动生成查询 DSL (派生查询)
+    // List<ProductDocument> findByCategoryId(Long categoryId);
+}
+```
+
+**对照 MyBatis-Plus**:
+
+| 概念 | MyBatis-Plus (MySQL) | Spring Data ES |
+|---|---|---|
+| 数据载体 | `@TableName` Entity | `@Document` Document |
+| DAO 接口 | `extends BaseMapper<T>` | `extends ElasticsearchRepository<T, ID>` |
+| 自动方法 | selectById/insert/updateById/... | findById/save/findAll/deleteById/... |
+| 底层 | 接口→动态代理→SQL→MySQL | 接口→动态代理→HTTP→ES |
+| 主键注解 | `@TableId` | `@Id` |
+
+### 75.5.2 ⭐ ES 的 save 是 upsert, 不是 insert!
+
+**关键认知**:
+- MP 的 `save` = INSERT, id 已存在会主键冲突
+- ES 的 `save` = **upsert** (有则覆盖, 无则插入)
+
+为什么? 因为 ES 的设计哲学是 **"索引就是一份可重建的副本"**, 同步时不需要区分新增 vs 更新, 直接覆盖最方便.
+
+所以 `syncAll` 里 `repository.saveAll(documents)` 重复跑也不会冲突.
+
+## 75.6 IProductSearchService 接口 + 实现分离
+
+### 75.6.1 为什么要接口 + 实现分离 (4 个理由)
+
+1. **Controller 只依赖接口** → 换实现不动调用代码
+2. **Spring AOP / @Transactional 底层用 JDK 动态代理, 必须有接口**
+3. **看接口能秒懂这个 service 对外能干啥**, 不必钻细节
+4. **接口可以共享** (本服务 implements, 别的服务也可以 implements 当 Feign 接口)
+
+### 75.6.2 IProductSearchService.java (4 方法)
+
+```java
+public interface IProductSearchService {
+
+    /** 全量同步: product 所有商品 → ES. 首次部署/索引重建/数据修复 */
+    int syncAll();
+
+    /** 单条同步: 商品上架/编辑/价格变动时调 (MQ 触发) */
+    void syncById(Long productId);
+
+    /** 单条删除: 商品下架/删除时调 */
+    void deleteById(Long productId);
+
+    /** 搜索: keyword/categoryId/price 区间 + 分页 + 排序 */
+    PageResultVO<ProductSearchVO> search(ProductSearchRequest request);
+}
+```
+
+**4 个方法定位**: 前 3 个**写 ES** (sync 系列), 第 4 个**读 ES** (search). 读写分离清晰.
+
+## 75.7 ProductSearchServiceImpl - sync 系列 (写 ES)
+
+### 75.7.1 同步 4 步法
+
+```java
+@Service
+@Slf4j
+public class ProductSearchServiceImpl implements IProductSearchService {
+
+    @Resource
+    private ProductDocumentRepository repository;
+    @Resource
+    private ProductFeignClient productFeignClient;
+    @Resource
+    private ElasticsearchOperations elasticsearchOperations;
+
+    @Override
+    public int syncAll() {
+        log.info("[search-sync] 开始全量同步商品...");
+        // 1. Feign 拉全量上架商品
+        Result<List<ProductSource>> result = productFeignClient.listAllForSync();
+        // 2. 失败兜底 (Sentinel 降级也走这里, result 是 fallback 的 error)
+        if (result.getCode() == null || result.getCode() != 200) {
+            log.error("[search-sync] 拉商品失败, message={}", result.getMessage());
+            return 0;
+        }
+        // 3. ⭐ ProductSource → ProductDocument (用 from 静态工厂)
+        List<ProductSource> sources = result.getData();
+        List<ProductDocument> documents = sources.stream()
+                .map(ProductDocument::from)            // 方法引用, 等价 (src -> ProductDocument.from(src))
+                .toList();
+        // 4. 批量灌 ES (saveAll 是 upsert, 内部走 _bulk API 高效写入)
+        repository.saveAll(documents);
+        log.info("[search-sync] 全量同步完成, 共 {} 条", documents.size());
+        return documents.size();
+    }
+
+    @Override
+    public void syncById(Long productId) {
+        // TODO: 后续 MQ 触发时填实现
+        log.info("syncById 还没实现, productId={}", productId);
+    }
+
+    @Override
+    public void deleteById(Long productId) {
+        repository.deleteById(productId);
+        log.info("[search-sync] 已从 ES 删除商品 productId={}", productId);
+    }
+}
+```
+
+### 75.7.2 ⭐ 包装类 == 比较的 NPE 坑
+
+```java
+if (result.getCode() == 200) {                 // ⚠ 有 NPE 风险
+```
+
+`result.getCode()` 返 `Integer`, 跟 `int 200` 比会**自动拆箱**, 如果 code 是 null 抛 NPE.
+
+**严谨写法**:
+```java
+if (result.getCode() == null || result.getCode() != 200) { return 0; }
+```
+
+是 Java 八股**包装类 == 比较拆箱 NPE** 经典考点.
+
+### 75.7.3 deleteById 不需要源数据
+
+ES 操作 vs 需要的数据:
+
+| 操作 | 需要数据 | 为什么 |
+|---|---|---|
+| save (写) | ID + 14 业务字段 | ES 要给每个字段建索引 |
+| findById (读) | 只要 ID | ES 用 ID 精确定位文档返完整 JSON |
+| deleteById (删) | 只要 ID | ES 用 ID 找文档**直接抹除**, 不关心里面有啥 |
+
+**核心认知**: "写"才需要完整数据, "读/删" 只要 ID. ES 的 deleteById 是**幂等**的 — 删一个不存在的 ID 不报错.
+
+## 75.8 ⭐ search 方法 - G9 最难一步 (读 ES)
+
+### 75.8.1 BoolQuery 灵魂 (面试常考)
+
+ES 复合查询用 `BoolQuery`, 4 个子句:
+
+| 子句 | 是否打分 | 是否缓存 | 用途 |
+|---|---|---|---|
+| **must** | ✅ 算分→影响相关度排序 | ❌ | 关键词搜内容 |
+| **filter** | ❌ 不算分 | ✅ 缓存 | 精确条件过滤 |
+| should | 至少满足一个 | — | OR 逻辑 |
+| mustNot | 必须不满足 | — | 排除 |
+
+**经验法则**:
+- `keyword` 搜 → **must** (要按相关度排序)
+- `categoryId` / `price` 区间 → **filter** (更快, 有缓存)
+
+### 75.8.2 search 完整代码
+
+```java
+@Override
+public PageResultVO<ProductSearchVO> search(ProductSearchRequest request) {
+    // ─── 1. 参数默认值 ────────────
+    int page = request.getPage() == null || request.getPage() < 1 ? 1 : request.getPage();
+    int size = request.getSize() == null || request.getSize() < 1 ? 10 : request.getSize();
+
+    // ─── 2. 构造 BoolQuery ──────
+    BoolQuery.Builder boolBuilder = new BoolQuery.Builder();
+
+    // 2a. keyword: multi_match 多字段模糊匹配 (must, 打分)
+    if (StringUtils.hasText(request.getKeyword())) {
+        Query keywordQuery = MultiMatchQuery.of(m -> m
+                .query(request.getKeyword())
+                .fields("name", "description", "detail")
+        )._toQuery();
+        boolBuilder.must(keywordQuery);
+    }
+
+    // 2b. categoryId: TermQuery 精确匹配 (filter, 不打分)
+    if (request.getCategoryId() != null) {
+        Query catQuery = TermQuery.of(t -> t
+                .field("categoryId")
+                .value(request.getCategoryId())
+        )._toQuery();
+        boolBuilder.filter(catQuery);
+    }
+
+    // 2c. price 区间: RangeQuery gte/lte (filter)
+    if (request.getMinPrice() != null || request.getMaxPrice() != null) {
+        Query priceQuery = RangeQuery.of(r -> {
+            r.field("price");
+            if (request.getMinPrice() != null) r.gte(JsonData.of(request.getMinPrice()));
+            if (request.getMaxPrice() != null) r.lte(JsonData.of(request.getMaxPrice()));
+            return r;
+        })._toQuery();
+        boolBuilder.filter(priceQuery);
+    }
+
+    // ─── 3. 包装成 NativeQuery (含分页 + 排序) ──
+    NativeQuery nativeQuery = NativeQuery.builder()
+            .withQuery(boolBuilder.build()._toQuery())
+            .withPageable(PageRequest.of(page - 1, size, parseSort(request.getSort())))
+            //              ⭐ page - 1 因为 PageRequest 从 0 开始 (经典坑)
+            .build();
+
+    // ─── 4. 执行查询 ──────────────
+    SearchHits<ProductDocument> hits = elasticsearchOperations.search(nativeQuery, ProductDocument.class);
+
+    // ─── 5. SearchHits → PageResultVO ─
+    List<ProductSearchVO> records = hits.getSearchHits().stream()
+            .map(SearchHit::getContent)           // SearchHit → ProductDocument
+            .map(ProductSearchVO::from)           // ProductDocument → VO
+            .toList();
+    long total = hits.getTotalHits();
+    long pages = (total + size - 1) / size;       // ⭐ 整数向上取整经典写法
+
+    log.info("[search] keyword={}, total={}, page={}/{}",
+            request.getKeyword(), total, page, pages);
+    return new PageResultVO<>(total, pages, page, size, records);
+}
+
+/** 解析 sort 字符串 → Spring Sort 对象 */
+private Sort parseSort(String sort) {
+    if (!StringUtils.hasText(sort)) return Sort.unsorted();
+    return switch (sort) {
+        case "price_asc"   -> Sort.by(Sort.Order.asc("price"));
+        case "price_desc"  -> Sort.by(Sort.Order.desc("price"));
+        case "sales_desc"  -> Sort.by(Sort.Order.desc("sales"));
+        case "rating_desc" -> Sort.by(Sort.Order.desc("avgRating"));
+        case "newest"      -> Sort.by(Sort.Order.desc("createTime"));
+        default            -> Sort.unsorted();
+    };
+}
+```
+
+### 75.8.3 5 个新 API 速查
+
+| API | 作用 |
+|---|---|
+| `BoolQuery.Builder().must/filter/should/mustNot` | 拼布尔查询 |
+| `MultiMatchQuery.of(m -> ...)` | 一个 keyword 搜多个字段 |
+| `TermQuery.of(t -> ...)` | 精确等值匹配 |
+| `RangeQuery.of(r -> ...).gte().lte()` | 区间过滤 |
+| `._toQuery()` | 新版 Java Client quirk: 具体 Query → 通用 Query 接口 |
+| `NativeQuery.builder().withQuery().withPageable().build()` | 查询包装器 |
+| `ElasticsearchOperations.search(q, T.class)` | 真正发 HTTP 到 ES |
+| `SearchHits<T>.getSearchHits().stream().map(SearchHit::getContent)` | 解析结果 |
+
+### 75.8.4 Repository vs ElasticsearchOperations
+
+| 用哪个 | 场景 |
+|---|---|
+| **Repository** | 简单 CRUD: save/findById/deleteById/saveAll |
+| **ElasticsearchOperations** | 复杂搜索: BoolQuery + 分页 + 排序 + 高亮 |
+
+口诀: **简单 CRUD 用 Repo, 复杂 Query 用 Operations**.
+
+## 75.9 ProductSearchController + 网关路由
+
+### 75.9.1 Controller (4 端点)
+
+```java
+@RestController
+@RequestMapping("/search")          // ⭐ 类前缀
+@Slf4j
+public class ProductSearchController {
+
+    @Resource
+    private IProductSearchService searchService;
+
+    @PostMapping("/sync")           // 全量同步 (运维触发)
+    public Result<Integer> syncAll() {
+        return Result.success(searchService.syncAll());
+    }
+
+    @PostMapping("/sync/{productId}")    // 单条同步 (后续 MQ)
+    public Result<Void> syncById(@PathVariable Long productId) {
+        searchService.syncById(productId);
+        return Result.success();
+    }
+
+    @DeleteMapping("/{productId}")       // 单条删除
+    public Result<Void> deleteById(@PathVariable Long productId) {
+        searchService.deleteById(productId);
+        return Result.success();
+    }
+
+    @GetMapping("/product")              // ⭐ 搜索 (核心入口)
+    public Result<PageResultVO<ProductSearchVO>> search(ProductSearchRequest request) {
+        return Result.success(searchService.search(request));
+    }
+}
+```
+
+**REST 方法语义**:
+- **GET** 读 (无副作用) — search
+- **POST** 写/创建 (有副作用) — sync
+- **DELETE** 删 — delete
+- ⚠ 不能搞反 (GET 不能改数据)
+
+`Result<Void>` 不返业务数据时用 (Void 不是 void), 配 `Result.success()` 无参版.
+
+### 75.9.2 网关路由 (gateway/application.yml)
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        # G9: Elasticsearch product search service (9005)
+        - id: search-route
+          uri: lb://mini-mall-search
+          predicates:
+            - Path=/search/**
+```
+
+**知识点**:
+- `lb://mini-mall-search` — LoadBalancer, 网关从 Nacos 拿所有实例 IP, 自动轮询
+- `Path=/search/**` 双星号通配, 命中 `/search/sync` / `/search/product` / `/search/sync/123` 全行
+
+## 75.10 端到端验证 (curl 实测)
+
+### 75.10.1 启动顺序
+
+```bash
+# Docker 容器
+docker start minimall-nacos minimall-sentinel seata-server
+# 已有: mini-mall-es, mini-mall-kibana, mini-mall-rabbitmq
+
+# 本机服务: MySQL :3306, Redis :6379 必须在
+
+# 启动 search jar
+java -jar mini-mall-search/target/mini-mall-search-0.0.1-SNAPSHOT.jar
+
+# 验证 Nacos 注册
+curl "http://127.0.0.1:8848/nacos/v1/ns/instance/list?serviceName=mini-mall-search"
+# 期望 "hosts":[{"ip":"...","port":9005,"healthy":true}]
+```
+
+### 75.10.2 全量同步
+
+```bash
+# 触发
+curl -X POST http://127.0.0.1:9005/search/sync
+# {"code":200,"data":3}
+
+# 看 ES 索引
+curl "http://127.0.0.1:9200/mini_mall_product/_count?pretty"
+# {"count": 3}
+
+# 看一条
+curl "http://127.0.0.1:9200/mini_mall_product/_search?size=1&pretty"
+# 能看到 {"_id":"1","_source":{"name":"小米 14 Pro",...}}
+```
+
+### 75.10.3 4 种搜索测试 (全过)
+
+| 测试 | 期望 | 实际 |
+|---|---|---|
+| 搜 "小米" | 只命中小米手机 | total:1 ✅ |
+| 不传 keyword | 返全部 | total:3 ✅ |
+| 价格 1000-3000 | 区间内 0 条 | total:0 ✅ filter 生效 |
+| sort=sales_desc | 销量降序 | 5 → 2 → 0 ✅ |
+
+**BoolQuery + multi_match + range filter + Sort 全部按预期工作** 🎯
+
+## 75.11 G9 踩的小坑速查
+
+| 坑 | 表现 | 原因 | 修 |
+|---|---|---|---|
+| ⭐ **改代码后 jar 没重打** | product `/internal/all` 返 `NoResourceFoundException` (404) | fat jar 是旧版本, 没有 G9.3.1 加的端点 | kill 进程 → `mvn install` → 重启 |
+| ⭐ IDE 自动 import 坑 (3 次) | `org.w3c.dom.Text` / `org.yaml.snakeyaml.Event.ID` / `org.aspectj.bcel.Code` | IDE 弹候选选错 | 永远先看包名 `com.minimall.*` / `java.*` / `org.springframework.*` |
+| BoolQuery must/filter 用反 | 精确过滤被打分影响 | 把 categoryId 放 must 了 | 改 filter (不打分, 有缓存) |
+| PageRequest 从 0 开始 | 第 1 页拿到第 2 页数据 | 直接传 page 没减 1 | `PageRequest.of(page - 1, size)` |
+| 包装类 == 拆箱 NPE | `result.getCode() == 200` 偶发 NPE | code 为 null 时拆箱失败 | 先判 `code == null` |
+| Bash 起 java 失败 (exit 127) | `command not found` | Git Bash PATH 里 java 是 Java 8 | 用 PowerShell + `$env:JAVA_HOME\bin\java.exe` 全路径 |
+| product 一直连不上 Seata | 日志刷 `Connection refused 8091` | Seata 容器停了 | `docker start seata-server` (虽然只是干扰日志, 不阻塞业务) |
+
+## 75.12 G9 教学速查 - 关键 API & 模式
+
+### ① ⭐ 静态工厂方法 from() (G9 重点)
+
+```java
+public static ProductDocument from(ProductSource src) {
+    ProductDocument doc = new ProductDocument();
+    doc.setId(src.getId());
+    // ... 字段一一 set
+    return doc;
+}
+```
+
+用法: `stream().map(ProductDocument::from).toList()`
+
+**3 个 from 用例**:
+- ProductSource → ProductDocument (G9.4.3 syncAll)
+- ProductDocument → ProductSearchVO (G9.4.4 search)
+- (之前 G7) Reviews → ReviewVO
+
+口诀: **set 在外(目标), get 在里(源)**. 数据流向只有一个: 源 → 目标.
+
+### ② BoolQuery 拼装套路
+
+```java
+BoolQuery.Builder b = new BoolQuery.Builder();
+if (cond1) b.must(query1);           // 关键词 (打分)
+if (cond2) b.filter(query2);          // 精确 (不打分)
+Query final = b.build()._toQuery();
+```
+
+### ③ NativeQuery 三件套
+
+```java
+NativeQuery q = NativeQuery.builder()
+    .withQuery(boolQuery)
+    .withPageable(PageRequest.of(page - 1, size, sort))
+    .build();
+SearchHits<T> hits = operations.search(q, T.class);
+```
+
+### ④ SearchHits 解析模板
+
+```java
+List<VO> records = hits.getSearchHits().stream()
+    .map(SearchHit::getContent)      // → Document
+    .map(VO::from)                    // → VO
+    .toList();
+long total = hits.getTotalHits();
+long pages = (total + size - 1) / size;
+```
+
+### ⑤ Repository 派生查询 (进阶, 没用上)
+
+```java
+public interface ProductDocumentRepository extends ElasticsearchRepository<ProductDocument, Long> {
+    List<ProductDocument> findByCategoryId(Long categoryId);
+    List<ProductDocument> findByStatusAndPriceLessThan(Byte status, BigDecimal price);
+}
+```
+
+Spring Data 看方法名匹配 findBy + 字段名 → 自动生成 ES 查询 DSL.
+
+## 75.13 G9 累计文件
+
+```
+父 pom 改:
+  pom.xml                          (解开 <module>mini-mall-search</module>)
+
+mini-mall-search/  (从 0 新建整个模块)
+├── pom.xml                                       (新建)
+├── src/main/resources/
+│   ├── application.yml                           (端口 9005 + ES + Nacos)
+│   └── application.yml.example                   (脱敏版给 GitHub)
+└── src/main/java/com/minimall/search/
+    ├── MiniMallSearchApplication.java            (启动类)
+    ├── document/ProductDocument.java             (⭐ ES 索引映射 + from)
+    ├── dto/ProductSearchRequest.java             (搜索条件)
+    ├── vo/ProductSearchVO.java                   (卡片字段 + from)
+    ├── vo/PageResultVO.java                      (泛型分页 VO)
+    ├── entity/ProductSource.java                 (⭐ Feign 数据载体)
+    ├── client/
+    │   ├── ProductFeignClient.java               (调 product)
+    │   └── ProductFeignClientFallback.java       (降级)
+    ├── repository/ProductDocumentRepository.java (⭐ ES 版 BaseMapper)
+    ├── service/
+    │   ├── IProductSearchService.java            (接口)
+    │   └── impl/ProductSearchServiceImpl.java    (⭐ sync + search 核心 ~120 行)
+    └── controller/ProductSearchController.java   (4 端点)
+
+product 服务改:
+  controller/ProductController.java               (+ /internal/all 端点)
+  service/IProductService.java                    (+ listAllForSync)
+  service/impl/ProductServiceImpl.java            (+ lambdaQuery status=1)
+
+gateway 改:
+  application.yml                                 (+ search-route, Path=/search/**)
+```
+
+## 75.14 ⭐ G9 学到的 10 个核心知识点
+
+1. **Elasticsearch 三大概念**: 文档 / 索引 / 倒排索引 + 分词器
+2. **Spring Data ES Repository = ES 版 MyBatis-Plus**: 1 行接口自动 CRUD
+3. **ES Field 类型选择**: Text 分词搜 / Keyword 精确 / Long/Double / Date
+4. **⭐ BoolQuery 灵魂**: must (打分) vs filter (不打分, 有缓存) — 面试常考
+5. **ES 复杂查询用 ElasticsearchOperations + NativeQuery**, 简单 CRUD 用 Repository
+6. **⭐ 微服务铁律**: 不共享 jar, ProductSource 副本 + Jackson 按字段名匹配反序列化
+7. **⭐ 静态工厂方法 from()**: 在目标类里写转换, `stream().map(类::方法)` 链式
+8. **接口 + 实现分离**: 4 个理由 (调用方依赖接口 / AOP 动态代理 / 可读性 / 可共享)
+9. **Feign + Fallback 降级**: 服务挂了不抛异常, 走兜底 Result.error (用 503 比 500 贴切)
+10. **⭐ 改代码后必须重新打包**: IDE 改的是源码, fat jar 不会自动同步 (G9 真实排坑)
+
+---
+
+**G9 完毕**. 微服务从 "完整电商核心" 走到 "**电商核心 + 搜索引擎**". 至此 mini-mall-cloud 业务能力齐全 (用户/商品/订单/库存/物流/评价/优惠券/搜索), 后续可选: C1 README + C2 GitHub 改名收尾, 或继续 G10 后台管理.

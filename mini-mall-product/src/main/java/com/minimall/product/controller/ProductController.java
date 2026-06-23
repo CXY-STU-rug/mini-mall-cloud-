@@ -126,4 +126,9 @@ public class ProductController {
         return Result.error(503, "下游服务繁忙, 暂时降级 (触发规则: "
                 + ex.getClass().getSimpleName() + ")");
     }
+    @GetMapping("/internal/all")
+    public Result<List<Product>> listAllForSync() {
+        return Result.success(productService.listAllForSync());
+    }
+
 }

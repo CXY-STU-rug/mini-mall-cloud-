@@ -52,9 +52,12 @@
         <!-- ⭐ G3.5 新增: Redis 客户端 (Favorite 用 Redis Set 存收藏)
              跟 order 用一样的 starter, 配置流程一样
              这是【第二次】在子模块里引 redis, 重复 N 次再抽 common-redis -->
+        <!-- ⭐ N=3 抽出 (common-redis): 替代直接引 spring-boot-starter-data-redis
+             自动获得: RedisTemplate Bean (含 JSON 序列化 + JavaTimeModule) + RedisService 工具 -->
         <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-redis</artifactId>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-redis</artifactId>
+            <version>0.0.1-SNAPSHOT</version>
         </dependency>
 
         <!-- ⭐ G5 新增: Seata AT 分布式事务客户端

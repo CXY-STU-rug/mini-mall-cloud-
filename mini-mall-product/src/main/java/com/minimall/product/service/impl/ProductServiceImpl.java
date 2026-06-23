@@ -1,5 +1,6 @@
 package com.minimall.product.service.impl;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
@@ -188,5 +189,10 @@ public class ProductServiceImpl
         redisTemplate.delete(cacheKey);
 
         log.info("[refreshRating] productId={} avg={} count={} 缓存已删", productId, avgRating, reviewCount);
+    }
+    @Override
+    public List<Product> listAllForSync() {
+        // 只灌"已上架"商品 (status=1), MP 自动加 is_deleted=0 过滤
+        return lambdaQuery().eq(Product::getStatus, (byte) 1).list();
     }
 }

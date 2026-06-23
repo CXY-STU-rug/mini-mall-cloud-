@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <!-- 父依赖 -->
+    <parent>
+        <groupId>com.minimall</groupId>
+        <artifactId>mini-mall-cloud</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+    <!-- 模块标识 -->
+    <artifactId>mini-mall-search</artifactId>
+    <name>mini-mall-search</name>
+    <description>商品搜索服务: ES 8.13.4</description>
+    <!-- 自己依赖 -->
+<dependencies>
+    <!-- 拿 Result + GlobalExceptionHandler,所有业务服务必备 -->
+    <dependency>
+        <groupId>com.minimall</groupId>
+        <artifactId>mini-mall-common-core</artifactId>
+    </dependency>
+    <!-- search 服务对外提供 HTTP API,@RestController 靠它 -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <!-- ES 8.x 客户端 + Spring Data Repository,Boot 3.3.5 自带,不写 version -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-elasticsearch</artifactId>
+    </dependency>
+    <!-- 跨服务调用依赖 -->
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-openfeign</artifactId>
+    </dependency>
+    <!-- @Getter/@Setter/@Slf4j 自动生成。optional=true 因为 common-core 已声明,这里不重复传递 -->
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

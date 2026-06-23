@@ -27,9 +27,9 @@
          ═══════════════════════════════════════════════════════════ -->
     <modules>
         <module>mini-mall-common-core</module>
+        <module>mini-mall-common-redis</module>
         <!-- 后续步骤逐个解开
         <module>mini-mall-common-security</module>
-        <module>mini-mall-common-redis</module>
         <module>mini-mall-common-swagger</module>
         -->
     </modules>

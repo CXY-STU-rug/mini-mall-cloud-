@@ -48,4 +48,9 @@ public interface IProductService extends IService<Product> {
      * 调用方: review 服务通过 Feign 调用 (评价落库后)
      */
     void refreshRating(Long productId);
+    /** 给 search 服务用: 拉所有上架商品 (status=1), 用于全量灌 ES 索引 */
+    List<Product> listAllForSync();
+
+
+
 }

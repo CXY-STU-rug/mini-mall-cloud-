@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         mini-mall-common-redis (公共 Redis 组件)
+
+         设计原则:
+           - 业务服务只依赖这一个包, 自动拿到:
+             ① spring-boot-starter-data-redis (Lettuce 连接)
+             ② RedisTemplate<String,Object> Bean (含 JSON 序列化 + LocalDateTime 支持)
+             ③ RedisService 工具类 (常用操作的瘦封装)
+           - 抽离触发: order+product+review 都要用 → N≥3, 终于到痛点了
+         ═══════════════════════════════════════════════════════════ -->
+    <parent>
+        <groupId>com.minimall</groupId>
+        <artifactId>mini-mall-common</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>mini-mall-common-redis</artifactId>
+    <name>mini-mall-common-redis</name>
+    <description>公共 Redis 组件: RedisTemplate 配置 + RedisService 工具</description>
+
+    <dependencies>
+        <!-- ① Spring Data Redis (含 Lettuce 客户端) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!-- ② Jackson + JSR-310 (让 LocalDateTime 能 JSON 序列化, G3.9 坑修复) -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+
+
+        <!-- ③ Lombok (RedisService 用 @Slf4j 写日志) -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+    </dependencies>
+
+</project>

@@ -35,6 +35,9 @@
         <module>mini-mall-order</module>
         <!-- ⭐ G7 新增：商品评价服务（单体没做，微服务版独有） -->
         <module>mini-mall-review</module>
+        <!-- G9 商品搜索服务，重新做时再解开-->
+        <module>mini-mall-search</module>
+
     </modules>
 
     <!-- ═══════════════════════════════════════════════════════════
@@ -51,7 +54,6 @@
         <!-- 微服务核心三件套 -->
         <spring-cloud.version>2023.0.3</spring-cloud.version>
         <spring-cloud-alibaba.version>2023.0.1.2</spring-cloud-alibaba.version>
-
         <!-- 业务工具 -->
         <mybatis-plus.version>3.5.9</mybatis-plus.version>
         <jjwt.version>0.12.6</jjwt.version>
@@ -207,6 +209,7 @@
             <groupId>com.alibaba.cloud</groupId>
             <artifactId>spring-cloud-starter-alibaba-sentinel</artifactId>
         </dependency>
+
     </dependencies>
 
     <!-- ═══════════════════════════════════════════════════════════
