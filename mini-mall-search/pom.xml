@@ -20,6 +20,11 @@
         <groupId>com.minimall</groupId>
         <artifactId>mini-mall-common-core</artifactId>
     </dependency>
+    <!-- ⭐ 公共 Swagger / Knife4j (OpenAPI Bean + JWT Bearer 鉴权方案) -->
+    <dependency>
+        <groupId>com.minimall</groupId>
+        <artifactId>mini-mall-common-swagger</artifactId>
+    </dependency>
     <!-- search 服务对外提供 HTTP API,@RestController 靠它 -->
     <dependency>
         <groupId>org.springframework.boot</groupId>

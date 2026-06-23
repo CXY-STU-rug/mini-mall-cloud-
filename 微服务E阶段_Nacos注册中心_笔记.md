@@ -11906,3 +11906,361 @@ gateway 改:
 ---
 
 **G9 完毕**. 微服务从 "完整电商核心" 走到 "**电商核心 + 搜索引擎**". 至此 mini-mall-cloud 业务能力齐全 (用户/商品/订单/库存/物流/评价/优惠券/搜索), 后续可选: C1 README + C2 GitHub 改名收尾, 或继续 G10 后台管理.
+
+
+
+# 76. common-swagger - Knife4j 公共配置
+
+> 抽到公共库, 5 个业务服务 (user/product/order/review/search) 一行依赖搞定 API 文档.
+
+## 76.0 总览 - 做了啥
+
+```
+mini-mall-common-swagger (新建子模块)
+├── pom.xml                              # 只引一个: knife4j-openapi3-jakarta-spring-boot-starter
+└── SwaggerConfig.java
+    └── @Bean OpenAPI miniMallOpenAPI()  # Info + JWT Bearer 鉴权方案
+
+5 个业务服务 pom 各加 1 段:
+    <dependency>
+        <groupId>com.minimall</groupId>
+        <artifactId>mini-mall-common-swagger</artifactId>
+    </dependency>
+
+启动后访问: http://<host>:<port>/doc.html
+```
+
+**核心收获**:
+1. **OpenAPI / Swagger / Knife4j / springdoc 4 个概念关系**
+2. **JWT Bearer 鉴权方案** (面试常考: HTTP type + bearer scheme + JWT format)
+3. **Servlet 3.0 静态资源规范** (META-INF/resources/ 自动映射到 web 根)
+4. **零配置设计**: 引依赖 → @ComponentScan 扫到 → Spring 自动注入 OpenAPI bean
+5. **改 pom 后必须重启 jar** (老 jar 没新依赖)
+
+## 76.1 4 个相关概念关系 (必须区分)
+
+```
+OpenAPI    ────  API 描述规范 (JSON/YAML 标准, Linux 基金会维护)
+   ↓
+Swagger    ────  最早实现 OpenAPI 的工具集 + 默认 UI
+   ↓
+springdoc  ────  Spring Boot 3 的 OpenAPI 自动扫描库 (扫 @RestController 生成文档)
+   ↓
+Knife4j    ────  在 springdoc 基础上, 替换默认 UI 为更漂亮的 Vue UI
+                 (中国人写的 Swagger 增强, 国内项目主流)
+```
+
+**我们用的栈** = `springdoc` (扫代码生成 OpenAPI JSON) + `knife4j` (好看的前端 UI).
+
+引一个 `knife4j-openapi3-jakarta-spring-boot-starter` 自动把这俩都拉进来.
+
+## 76.2 mini-mall-common-swagger 子模块
+
+### 76.2.1 父 pom 解开模块注释 (注意只解 swagger, security 留着!)
+
+```xml
+<modules>
+    <module>mini-mall-common-core</module>
+    <module>mini-mall-common-redis</module>
+    <module>mini-mall-common-swagger</module>
+    <!-- 后续做完再解开
+    <module>mini-mall-common-security</module>
+    -->
+</modules>
+```
+
+⚠ **坑**: 一次解多了 — 把 common-security 也解开但目录不存在, `mvn install` 必爆 "Could not find module". 哪个建好了才解哪个.
+
+### 76.2.2 mini-mall-common-swagger/pom.xml (最小依赖)
+
+```xml
+<parent>
+    <groupId>com.minimall</groupId>
+    <artifactId>mini-mall-common</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+</parent>
+
+<artifactId>mini-mall-common-swagger</artifactId>
+
+<dependencies>
+    <!-- ① Knife4j (含 springdoc-openapi 自动扫描 + Knife4j UI 增强) -->
+    <!-- 版本父 pom 已锁 4.5.0, 这里不写 version -->
+    <dependency>
+        <groupId>com.github.xiaoymin</groupId>
+        <artifactId>knife4j-openapi3-jakarta-spring-boot-starter</artifactId>
+    </dependency>
+
+    <!-- ② Lombok (SwaggerConfig 可能用 @Slf4j) -->
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+```
+
+⚠ **3 个常犯的依赖错**:
+| 错 | 为啥错 |
+|---|---|
+| `knife4j-spring-boot-starter` (没 -openapi3-jakarta-) | 那是 Swagger 2 + Spring Boot 2 老版, Spring Boot 3 用不了 |
+| 显式引 `spring-boot-starter-web` | knife4j-starter 内部已经传递了 spring-web, 重复引污染依赖 |
+| 引 `mini-mall-common-base` | 项目里没这个 artifact (应该是 -core, 但 swagger 不依赖业务的 Result, 干脆不引) |
+
+## 76.3 SwaggerConfig.java (核心)
+
+### 76.3.1 完整代码
+
+```java
+package com.minimall.common.swagger.config;
+
+import io.swagger.v3.oas.models.Components;
+import io.swagger.v3.oas.models.OpenAPI;
+import io.swagger.v3.oas.models.info.Contact;
+import io.swagger.v3.oas.models.info.Info;
+import io.swagger.v3.oas.models.info.License;
+import io.swagger.v3.oas.models.security.SecurityRequirement;
+import io.swagger.v3.oas.models.security.SecurityScheme;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class SwaggerConfig {
+
+    /** 取当前服务的 spring.application.name 作为文档标题 */
+    @Value("${spring.application.name:mini-mall-cloud}")
+    private String appName;
+
+    @Bean
+    public OpenAPI miniMallOpenAPI() {
+        // ① 文档头部信息
+        Info info = new Info()
+                .title(appName + " API 文档")
+                .description("mini-mall-cloud 微服务电商 API (基于 Knife4j + OpenAPI 3)")
+                .version("0.0.1-SNAPSHOT")
+                .contact(new Contact()
+                        .name("CXY-STU-rug")
+                        .url("https://github.com/CXY-STU-rug/mini-mall-cloud"))
+                .license(new License().name("MIT"));
+
+        // ② JWT Bearer 鉴权方案 (面试常考)
+        SecurityScheme jwtScheme = new SecurityScheme()
+                .type(SecurityScheme.Type.HTTP)
+                .scheme("bearer")
+                .bearerFormat("JWT")
+                .description("JWT token (登录后从 /user/login 拿)");
+
+        // ③ 组装: info + components(挂鉴权方案) + 全局应用鉴权
+        return new OpenAPI()
+                .info(info)
+                .components(new Components()
+                        .addSecuritySchemes("Bearer", jwtScheme))    // 注册名 "Bearer"
+                .addSecurityItem(new SecurityRequirement().addList("Bearer"));
+                //                                            ^^^^ 引用上面名字, 大小写敏感
+    }
+}
+```
+
+### 76.3.2 ⭐ JWT Bearer 鉴权方案 3 件套 (面试常考)
+
+```java
+new SecurityScheme()
+    .type(SecurityScheme.Type.HTTP)    // ← 走 HTTP Header 鉴权
+    .scheme("bearer")                  // ← 用 Bearer Token 模式
+    .bearerFormat("JWT")               // ← 提示这是 JWT 格式
+```
+
+**效果**: Knife4j UI 顶部出现 **Authorize** 按钮, 点开输入 JWT → 之后所有请求自动带:
+```
+Authorization: Bearer <token>
+```
+
+### 76.3.3 ⭐ Bean 注入而不是 @EnableXxx 注解
+
+**没有什么 `@EnableSwagger` / `@EnableKnife4j` 注解**! 全是 Spring Bean 扫描机制:
+
+1. SwaggerConfig 在 `com.minimall.common.swagger.config` 包
+2. 业务服务启动类用 `@ComponentScan("com.minimall")` 扫描范围扩到顶层包
+3. Spring 启动时自动扫到 SwaggerConfig + @Configuration + @Bean
+4. 生成 OpenAPI bean, springdoc 检测到这个 bean 就用它当全局配置
+
+跟 common-redis 的 RedisConfig 走的是**完全一样的注入套路**.
+
+## 76.4 5 个业务服务 pom 加依赖
+
+每个 pom 在 common-core 后面加一段:
+
+```xml
+<dependency>
+    <groupId>com.minimall</groupId>
+    <artifactId>mini-mall-common-core</artifactId>
+</dependency>
+
+<!-- ⭐ 公共 Swagger / Knife4j -->
+<dependency>
+    <groupId>com.minimall</groupId>
+    <artifactId>mini-mall-common-swagger</artifactId>
+</dependency>
+```
+
+5 个加: **user / product / order / review / search**. 网关 gateway 跳过 (WebFlux 不是 WebMVC, 网关聚合文档要另搞).
+
+## 76.5 ⭐ /doc.html 为啥不用配置就能访问 (Servlet 3.0 规范)
+
+```
+knife4j-openapi3-ui-4.5.0.jar 里有:
+  META-INF/resources/doc.html         (1903 字节, Vue SPA 入口)
+  META-INF/resources/webjars/css/...
+  META-INF/resources/webjars/js/...
+```
+
+**Spring Boot 静态资源约定** (Servlet 3.0 引入):
+
+| jar 里的路径 | 自动映射到 |
+|---|---|
+| `static/foo.html` | `http://host/foo.html` |
+| `public/foo.html` | `http://host/foo.html` |
+| **`META-INF/resources/foo.html`** | **`http://host/foo.html`** |
+| `webjars/bootstrap/css/x.css` | `http://host/webjars/bootstrap/css/x.css` |
+
+**核心**: Spring Boot 启动时扫所有 classpath jar 的 `META-INF/resources/`, 把内容映射到 web 根目录.
+
+**所以**:
+1. Knife4j 把 `doc.html` 放 `META-INF/resources/`
+2. 你 pom 引依赖 → 这个 jar 进 classpath
+3. Spring Boot 自动暴露 `http://host/doc.html`
+4. **不用任何 @Controller, 不用任何配置**
+
+这是**零配置设计哲学**.
+
+### Knife4j vs 原生 Swagger 入口对比
+
+| 工具 | 默认入口 |
+|---|---|
+| 原生 Swagger UI | `/swagger-ui/index.html` |
+| **Knife4j** | **`/doc.html`** ← 有自己一套 Vue UI |
+| springdoc-openapi | `/swagger-ui/index.html` (用原生 UI) |
+
+引了 Knife4j 后**两个 UI 都能开**, 但 Knife4j 更好看, 国内主流.
+
+## 76.6 端到端验证
+
+```bash
+# 1. mvn install (11 模块全 SUCCESS)
+mvn clean install -DskipTests
+
+# 2. 启动 user-service
+java -jar mini-mall-user/target/mini-mall-user-0.0.1-SNAPSHOT.jar
+
+# 3. 验证 OpenAPI JSON
+curl http://127.0.0.1:9001/v3/api-docs
+# {"openapi":"3.0.1","info":{"title":"mini-mall-user API 文档",...
+#  "security":[{"Bearer":[]}],   ← JWT 鉴权方案生效 ✅
+#  "paths":{"/user/address/{id}":{...}, ...}}
+
+# 4. 验证 UI
+curl -I http://127.0.0.1:9001/doc.html
+# HTTP/1.1 200    ← 浏览器能打开 ✅
+```
+
+**预期效果** (浏览器看 doc.html):
+- 顶部标题: **mini-mall-user API 文档** (appName 自动替换)
+- 左侧端点列表: register / login / me / address / coupon / ...
+- 每个端点点开看参数 / 返回值 / 调试按钮
+- 右上角 **Authorize** 按钮 (点开就是输入 JWT 的弹窗)
+
+## 76.7 踩的小坑速查
+
+| 坑 | 表现 | 修 |
+|---|---|---|
+| **改完 pom 后没重启 jar** | `/doc.html` 404 / 老内容 | kill 进程 + mvn install + 重启 |
+| **mvn clean 报错占用** | `Failed to delete xxx.jar` | 先 kill 所有 java 进程 (`Stop-Process java`) |
+| 父 pom 解多了 module 注释 | `Could not find module 'mini-mall-common-security'` | 没建的不要解开 |
+| 包目录手敲错字 | `con**fog**` 而不是 `con**fig**` | IDEA 右键 New > Package 自动建嵌套, 别手动 mkdir |
+| import 选错版本 | `io.swagger.annotations.*` (Swagger 2 注解) | 必须 `io.swagger.v3.oas.models.*` (OpenAPI 3) |
+| @EnableSwagger 找不到 | 找了一个不存在的注解 | 没有这个东西! 全是 Spring Bean 扫描机制 |
+
+## 76.8 教学速查 - 5 个新概念
+
+### ① OpenAPI builder 链式调用
+
+```java
+OpenAPI api = new OpenAPI()
+    .info(...)
+    .components(...)
+    .addSecurityItem(...);
+```
+
+每个方法返回 `OpenAPI` 自己, 可链式. 跟 Spring Data 的 PageRequest / NativeQueryBuilder 套路一样.
+
+### ② Components 是公共定义池
+
+```java
+Components components = new Components()
+    .addSecuritySchemes("Bearer", jwtScheme)    // 鉴权方案
+    .addSchemas(...)                             // 通用 schema
+    .addResponses(...);                          // 通用响应
+```
+
+注册的东西**不会自动生效**, 必须用 `addSecurityItem` / `$ref` 引用才生效.
+
+### ③ SecurityRequirement 全局应用 vs 单方法应用
+
+全局 (我们用的):
+```java
+.addSecurityItem(new SecurityRequirement().addList("Bearer"));
+```
+单方法 (springdoc):
+```java
+@SecurityRequirement(name = "Bearer")  // 加在 @GetMapping 方法上
+public ... someMethod() { ... }
+```
+
+我们项目: 全局应用一次, 不需要鉴权的端点 (如 /user/login) 会被 Spring Security 在过滤器层放行, Swagger 文档显示会带锁图标但不强制.
+
+### ④ Servlet 3.0 META-INF/resources
+
+Jar 文件里 `META-INF/resources/` 目录的内容自动映射到 web 根目录. 这是 Servlet 3.0 引入的 "jar 自带静态资源" 规范.
+
+WebJars (Bootstrap/jQuery 等) 也是利用这个机制, 把 css/js 打进 jar 里发布.
+
+### ⑤ @Value 配置注入默认值语法
+
+```java
+@Value("${spring.application.name:mini-mall-cloud}")
+                                  ↑
+                       默认值 (key 不存在或为空时用)
+```
+
+冒号后面是默认值, 没冒号且 key 不存在 → 启动报错 IllegalArgumentException.
+
+## 76.9 累计文件
+
+```
+父 pom 改:
+  mini-mall-common/pom.xml         (解开 <module>mini-mall-common-swagger</module>)
+
+mini-mall-common-swagger/  (从 0 新建)
+├── pom.xml                                  (只引 knife4j-starter + lombok)
+└── src/main/java/com/minimall/common/swagger/config/
+    └── SwaggerConfig.java                   (~50 行, OpenAPI bean)
+
+5 个业务服务 pom 各加 1 段 dependency:
+  mini-mall-user/pom.xml
+  mini-mall-product/pom.xml
+  mini-mall-order/pom.xml
+  mini-mall-review/pom.xml
+  mini-mall-search/pom.xml
+```
+
+## 76.10 ⭐ G9 + common-swagger 学到的核心知识 (合集)
+
+延续 G9 的 10 大知识, common-swagger 再补 3 条:
+
+11. **Spring Bean 扫描 + @ComponentScan("com.minimall")** — common 库的配置类被业务自动扫到, 不需要任何 @EnableXxx 注解
+12. **Servlet 3.0 META-INF/resources/** — jar 里的静态资源自动映射到 web 根, Knife4j / WebJars 都用这个机制
+13. **OpenAPI 3 + Knife4j** — Spring Boot 3 标准: knife4j-openapi3-jakarta-spring-boot-starter + io.swagger.v3.oas.models.* 注解
+
+---
+
+**common-swagger 完毕**. mini-mall-cloud 至此基础库 3/4: **core / redis / swagger**, 只剩 common-security 抽鉴权. 业务 100% + 文档统一, 项目"能展示" + "能讲清楚架构".

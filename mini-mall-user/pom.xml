@@ -34,6 +34,12 @@
             <artifactId>mini-mall-common-core</artifactId>
         </dependency>
 
+        <!-- ⭐ 公共 Swagger / Knife4j (OpenAPI Bean + JWT Bearer 鉴权方案) -->
+        <dependency>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-swagger</artifactId>
+        </dependency>
+
         <!-- ⭐ F2.9 新增：Sentinel 规则持久化到 Nacos
              SCA BOM 自动锁版本(跟 sentinel-core 同步)
              启动时 user-service 会去 Nacos 拉规则 + 订阅推送
