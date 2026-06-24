@@ -1,5 +1,6 @@
 package com.minimall.review.controller;
 
+import com.minimall.common.core.context.SecurityContextHolder;
 import com.minimall.common.core.domain.Result;
 import com.minimall.review.dto.CreateReviewDTO;
 import com.minimall.review.service.IReviewsService;
@@ -26,7 +27,8 @@ import java.util.Map;
  *   - /review/product/...           资源是商品的评价
  *   - /review/user                  资源是我自己的评价
  * <p>
- * userId 来源: 网关解 JWT 后透传的 X-User-Id header (B 阶段 + D3 已建立)
+ * userId 来源 (SEC.10 重构): SecurityContextHolder.getUserId()
+ *   网关解 JWT 写 X-User-Id 头 → common-security HeaderInterceptor 放 ThreadLocal → Controller 拿
  *   不从前端 body 拿 - 前端可篡改
  */
 @RestController
@@ -48,9 +50,9 @@ public class ReviewController {
      */
     @PostMapping
     public Result<Long> create(
-            @Valid @RequestBody CreateReviewDTO dto,
-            @RequestHeader("X-User-Id") Long userId
+            @Valid @RequestBody CreateReviewDTO dto
     ) {
+        Long userId= SecurityContextHolder.getUserId();
         Long reviewId = reviewsService.createReview(userId, dto);
         return Result.success(reviewId);
     }
@@ -67,7 +69,8 @@ public class ReviewController {
     // ③ 查"我的"评价 (需登录)
     // ════════════════════════════════════════════════════════════════
     @GetMapping("/user")
-    public Result<List<ReviewVO>> listMyReviews(@RequestHeader("X-User-Id") Long userId) {
+    public Result<List<ReviewVO>> listMyReviews() {
+        Long userId= SecurityContextHolder.getUserId();
         return Result.success(reviewsService.listMyReviews(userId));
     }
 

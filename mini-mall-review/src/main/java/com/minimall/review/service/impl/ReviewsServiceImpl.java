@@ -62,9 +62,9 @@ public class ReviewsServiceImpl
     public Long createReview(Long userId, CreateReviewDTO dto) {
 
         // ─── 第 1 步: Feign 调 order 拿订单详情 ──────────────────
-        // 顺便把 X-User-Id 透传给 order, order 那边自带校验"订单是不是你的"
+        // SEC.11: X-User-Id 由 FeignAuthInterceptor 自动透传, 不再当形参传
         Result<Map<String, Object>> orderRet =
-                ordersFeignClient.getOrderDetail(dto.getOrderId(), userId);
+                ordersFeignClient.getOrderDetail(dto.getOrderId());
 
         // ✅ TODO ① 校验 Feign 调用结果
         if (orderRet.getCode() != 200) {

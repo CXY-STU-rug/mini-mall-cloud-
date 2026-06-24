@@ -22,8 +22,9 @@ public class UserFeignClientFallback implements UserFeignClient {
     private static final Logger log = LoggerFactory.getLogger(UserFeignClientFallback.class);
 
     @Override
-    public Result<Map<String, Object>> getAddress(Long id, Long userId) {
-        log.warn("[Feign-Fallback] user.getAddress 降级 addressId={} userId={}", id, userId);
+    public Result<Map<String, Object>> getAddress(Long id) {
+        // userId 不再当形参传, FeignAuthInterceptor 已经透传; 排查日志用 SecurityContextHolder 取
+        log.warn("[Feign-Fallback] user.getAddress 降级 addressId={}", id);
         return Result.error(503, "用户服务暂不可用,请稍后再试");
     }
 

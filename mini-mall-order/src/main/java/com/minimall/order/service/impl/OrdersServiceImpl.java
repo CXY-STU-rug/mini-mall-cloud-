@@ -121,7 +121,9 @@ public class OrdersServiceImpl extends ServiceImpl<OrdersMapper, Orders> impleme
                 }
 
                 // ─── 第 2 步: 地址校验 (Feign 调 user 服务) ─
-                Result<Map<String, Object>> addrResp = userFeignClient.getAddress(dto.getAddressId(), userId);
+                // ⭐ SEC.11: userId 不再当形参传; FeignAuthInterceptor 会从 SecurityContextHolder
+                //    取出 userId 自动塞 X-User-Id 头, 下游 user 服务照常校验
+                Result<Map<String, Object>> addrResp = userFeignClient.getAddress(dto.getAddressId());
                 if (addrResp == null || addrResp.getCode() != 200 || addrResp.getData() == null) {
                     throw new BusinessException(403, "收货地址无效");
                 }

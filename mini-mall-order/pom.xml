@@ -112,7 +112,12 @@
             <groupId>com.alibaba.cloud</groupId>
             <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
         </dependency>
-
+        <!-- ⭐ common-security: 自动从 X-User-Id 头部塞 SecurityContextHolder -->
+        <!--    Feign 调用时自动透传, 业务代码 0 配置 -->
+        <dependency>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-security</artifactId>
+        </dependency>
     </dependencies>
 
     <!-- ═══════════════════════════════════════════════════════════

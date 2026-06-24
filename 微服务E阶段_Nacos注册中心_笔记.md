@@ -8617,6 +8617,288 @@ T+30s    POST /seckill/3, alice (重复)     → 400 您已参与过此次秒杀
 | @Bean 化 Lua 脚本 | EVALSHA 优化, 启动时一次性加载 |
 | 跨服务调用 (Feign 调 product) | 跟 G3.7 一致 |
 
+---
+
+# Chapter 77 · SEC 阶段 · common-security 抽取
+
+> 📎 **完整源码+逐行解释见同目录 docx**:[`Chapter77_common-security_抽取.docx`](./Chapter77_common-security_抽取.docx)
+
+## 77.1  这次做了什么
+
+把 JWT / 拦截器 / Feign 透传抽成共享 jar `mini-mall-common-security`,业务代码 0 配置接入。
+业务代码再也不出现 `@RequestHeader("X-User-Id")`, 也不出现 "Feign 调用要传 userId" 这种 HTTP/RPC 细节。
+
+**改造前 ❌:**
+```java
+@PostMapping("/order/create")
+public Result<Long> createOrder(
+        @RequestHeader("X-User-Id") Long userId,   // 业务侵入了 HTTP 细节
+        @RequestBody OrderCreateDTO dto) { ... }
+
+// Feign 接口
+@GetMapping("/user/address/{id}")
+Result<...> getAddress(@PathVariable Long id,
+                       @RequestHeader("X-User-Id") Long userId);   // 形参绑死
+
+// 调用方
+userFeignClient.getAddress(addressId, userId);   // 多传一个参数
+```
+
+**改造后 ✅:**
+```java
+@PostMapping("/order/create")
+public Result<Long> createOrder(@RequestBody OrderCreateDTO dto) {
+    Long userId = SecurityContextHolder.getUserId();   // 业务只关心"当前用户"
+    ...
+}
+
+// Feign 接口
+@GetMapping("/user/address/{id}")
+Result<...> getAddress(@PathVariable Long id);   // 干净
+
+// 调用方
+userFeignClient.getAddress(addressId);   // FeignAuthInterceptor 自动塞 X-User-Id 头
+```
+
+## 77.2  一次完整跨服务调用的链路
+
+```
+① 前端发 Authorization: Bearer xxx → gateway:9080
+     gateway.AuthGlobalFilter (WebFlux GlobalFilter):
+         解 JWT → 写入 X-User-Id HTTP 头 → 转发 (旧逻辑)
+
+② HTTP 请求带 X-User-Id 头 → user-service:9001 (MVC)
+     HeaderInterceptor.preHandle():
+         读 X-User-Id 头 → SecurityContextHolder.setUserId()   ★ 新增
+     UserController.xxxMethod():
+         Long uid = SecurityContextHolder.getUserId();         ★ 业务直接拿
+     UserService 内部调 Feign:
+         someFeignClient.method(args)
+     FeignAuthInterceptor.apply(template):                     ★ 新增
+         SecurityContextHolder.getUserId() → template.header("X-User-Id")
+     HeaderInterceptor.afterCompletion():
+         SecurityContextHolder.remove()   (防 ThreadLocal 内存泄漏)
+
+③ Feign 出去的请求自带 X-User-Id 头 → product-service:9002
+     重复 ② 的流程
+```
+
+## 77.3  common-security 4 大组件
+
+| 组件 | 位置 | 职责 |
+|---|---|---|
+| `JwtUtil` | `util/JwtUtil.java` | 生成/解析 token (合并自 user+gateway 两份) |
+| `JwtProperties` | `properties/JwtProperties.java` | `@ConfigurationProperties` 绑 yml `jwt.*` |
+| `HeaderInterceptor` | `interceptor/HeaderInterceptor.java` | 进站: `X-User-Id` 头 → `SecurityContextHolder` |
+| `FeignAuthInterceptor` | `interceptor/FeignAuthInterceptor.java` | 出站: `SecurityContextHolder` → `X-User-Id` 头 |
+
+加上自动装配 3 件套:`SecurityAutoConfiguration` + `WebMvcConfig` + `AutoConfiguration.imports`。
+
+## 77.4  HeaderInterceptor 源码 (进站)
+
+```java
+@Slf4j
+public class HeaderInterceptor implements HandlerInterceptor {
+
+    public static final String HEADER_USER_ID = "X-User-Id";
+    public static final String HEADER_USER_NAME = "X-User-Name";
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+        // 读 X-User-Id 头 → 塞 ThreadLocal
+        String userId = request.getHeader(HEADER_USER_ID);
+        if (StringUtils.hasText(userId)) {
+            SecurityContextHolder.setUserId(userId);
+        }
+        String userName = request.getHeader(HEADER_USER_NAME);
+        if (StringUtils.hasText(userName)) {
+            SecurityContextHolder.setUserName(userName);
+        }
+        return true;
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler, Exception ex) {
+        // ⭐⭐⭐ 必须清, 否则 Tomcat 线程池复用时下一个请求会看到上一个的 userId
+        SecurityContextHolder.remove();
+    }
+}
+```
+
+**关键点:**
+- `implements HandlerInterceptor`:Spring MVC 标准拦截器接口
+- `StringUtils.hasText(...)`:Spring 工具,"非 null 且去空白后非空"
+- `return true`:不返 true Spring 会拦下请求
+- `afterCompletion + remove()`:不清就会出 "看到别人订单" 这种灵异 bug
+
+## 77.5  FeignAuthInterceptor 源码 (出站)
+
+```java
+@Slf4j
+public class FeignAuthInterceptor implements RequestInterceptor {
+
+    @Override
+    public void apply(RequestTemplate template) {
+        Long uid = SecurityContextHolder.getUserId();
+        String uname = SecurityContextHolder.getUserName();
+        if (uid != 0L) {
+            template.header(HeaderInterceptor.HEADER_USER_ID, String.valueOf(uid));
+        }
+        if (StringUtils.hasText(uname)) {
+            template.header(HeaderInterceptor.HEADER_USER_NAME, uname);
+        }
+    }
+}
+```
+
+**关键点:**
+- `implements feign.RequestInterceptor`:OpenFeign 自己的拦截器接口(注意包名,跟 Spring 的 HandlerInterceptor 完全两套)
+- Feign 发 HTTP 之前调 `apply()`,给我们改 `RequestTemplate` 的机会
+- `uid != 0L`:`SecurityContextHolder.getUserId()` 没登录返回 0(common-core 约定)
+- 用 `HeaderInterceptor.HEADER_USER_ID` 常量,跟入站读的是同一个头名
+
+## 77.6  ⭐ 最深的坑 — @ConditionalOnClass + @Import 不能混用
+
+**错误版** (gateway 启动爆 `NoClassDefFoundError: WebMvcConfigurer`):
+
+```java
+@AutoConfiguration
+@Import({WebMvcConfig.class, JwtUtil.class})   // Class 字面量 → 强制 JVM 加载
+public class SecurityAutoConfiguration { ... }
+
+@Configuration
+@ConditionalOnClass(name = "...WebMvcConfigurer")   // 来不及拦, 类已经被加载
+public class WebMvcConfig implements WebMvcConfigurer { ... }
+```
+
+**报错原因:**
+1. JVM 加载 `SecurityAutoConfiguration` 字节码
+2. 看到 `@Import(WebMvcConfig.class)` ← 强制把 `WebMvcConfig` 加载进 ClassLoader
+3. 加载 `WebMvcConfig` 时发现 `implements WebMvcConfigurer`
+4. JVM 要找 `WebMvcConfigurer` 这个接口
+5. gateway 没有 spring-webmvc → **找不到 → NoClassDefFoundError**
+6. `@ConditionalOnClass` 是"是否实例化 Bean"的检查,**类加载比这更早**,根本来不及拦
+
+**正确版** (走 `AutoConfiguration.imports` + ASM 字节码扫描):
+
+```java
+// SecurityAutoConfiguration: 删掉对 WebMvcConfig 的 @Import
+@AutoConfiguration
+@EnableConfigurationProperties(JwtProperties.class)
+@Import(JwtUtil.class)
+public class SecurityAutoConfiguration {
+    @Bean
+    public FeignAuthInterceptor feignAuthInterceptor() {
+        return new FeignAuthInterceptor();
+    }
+}
+
+// WebMvcConfig: 升级成独立 @AutoConfiguration
+@AutoConfiguration                                         // ← @AutoConfiguration 不是 @Configuration
+@ConditionalOnClass(name = "...WebMvcConfigurer")          // ← 字符串名, 不是 class
+public class WebMvcConfig implements WebMvcConfigurer {
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(new HeaderInterceptor());
+    }
+}
+```
+
+```
+# META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+com.minimall.common.security.config.SecurityAutoConfiguration
+com.minimall.common.security.config.WebMvcConfig
+```
+
+**为什么能避免 NoClassDefFoundError:**
+- Spring 解析 imports 文件时**用 ASM 字节码扫描**预检 `@ConditionalOnClass`
+- `name="..."` 字符串形式让 ASM 在 classpath 字节码里**搜类名**,**完全不加载 WebMvcConfig 类本身**
+- gateway 找不到 `WebMvcConfigurer` → 条件不满足 → **直接跳过**,JVM 根本不碰 `WebMvcConfig`
+- 业务服务找得到 → 条件满足 → 真正加载并实例化
+
+## 77.7  Controller 改造范围 (SEC.10)
+
+总共 8 个 Controller, 25 处 `@RequestHeader` 改 `SecurityContextHolder.getUserId()`:
+
+| 服务 | Controller | 处数 |
+|---|---|---|
+| user | UserController | 1 |
+| user | CouponController | 2 |
+| user | AddressController | 5 |
+| product | FavoriteController | 4 |
+| order | CartItemController | 4 |
+| order | OrdersController | 5 (sign 改, ship 不改) |
+| order | SeckillController | 2 |
+| review | ReviewController | 2 |
+
+改造模板(情况 A — 唯一参数):
+```java
+// 之前
+public Result<List<XxxVO>> xxx(@RequestHeader("X-User-Id") Long userId) { ... }
+// 之后
+public Result<List<XxxVO>> xxx() {
+    Long userId = SecurityContextHolder.getUserId();
+    ...
+}
+```
+
+改造模板(情况 B — 跟 @PathVariable / @RequestBody 共存):
+```java
+// 之前
+public Result<X> create(@RequestHeader("X-User-Id") Long userId, @RequestBody Dto dto) { ... }
+// 之后 (删 @RequestHeader 那一行 + 多余的逗号)
+public Result<X> create(@RequestBody Dto dto) {
+    Long userId = SecurityContextHolder.getUserId();
+    ...
+}
+```
+
+**例外:** admin 端点(如 `OrdersController.ship`)本来就不取 userId,**不要改**。
+
+## 77.8  Feign Client 改造范围 (SEC.11)
+
+⭐ 三处对齐:**接口 / Fallback / 所有调用方**,缺一不可!
+
+| 服务 | 文件 | 改动 |
+|---|---|---|
+| order | `client/UserFeignClient` | 接口删 `@RequestHeader` 形参 |
+| order | `client/fallback/UserFeignClientFallback` | `getAddress` 改成单参 |
+| order | `service/impl/OrdersServiceImpl` line 124 | 调用删 `userId` 实参 |
+| review | `client/OrdersFeignClient` | 接口删 `@RequestHeader` 形参 |
+| review | `client/fallback/OrdersFeignClientFallback` | `getOrderDetail` 改成单参 |
+| review | `service/impl/ReviewsServiceImpl` line 67 | 调用删 `userId` 实参 |
+
+如果只改 Feign 接口忘了 Fallback,**编译报 "未覆盖抽象方法"**;
+忘了调用方,**编译报 "实际参数列表长度不同"**。
+
+## 77.9  端到端验证 (SEC.12)
+
+启动 4 个服务(gateway + user + product + order),用 `alice/123456` 登录:
+
+| # | 端点 | 验证项 | 结果 |
+|---|---|---|---|
+| ① | POST /user/login | 白名单跳过 + JWT 生成 | ✅ token |
+| ② | GET /user/me | gateway 解 JWT → 塞 X-User-Id → user 服务 HeaderInterceptor → SecurityContextHolder.getUserId()=1 | ✅ userId=1 |
+| ③ | GET /user/address | user 服务 SecurityContextHolder 工作 + 查 alice 2 地址 | ✅ |
+| ④ | GET /order/my | order 服务【独立】走通同样链路 + 查 alice 14 订单 | ✅ |
+| ⑤ | GET /user/1/with-product/1 | user → Feign 出站调 product, FeignAuthInterceptor 不破坏链路 | ✅ |
+
+## 77.10  踩坑实录
+
+1. **`@ConditionalOnClass + @Import` 不能混用** — 详见 77.6
+2. **`provided` scope 不传递** — common-security pom 必须显式加 `jakarta.servlet-api` (`provided`)
+3. **Windows 多 JDK PATH 顺序坑** — JAVA_HOME=Java 21 但 PATH 里 Java 8 在前,要用绝对路径 `& "D:\jdk-21.0.11\bin\java.exe"`
+
+## 77.11  本轮累计能力
+
+| 能力 | 适合场景 |
+|---|---|
+| 共享 jar 自动配置 (`@AutoConfiguration` + imports) | 抽任何"业务无关的横切机制"(认证/限流/日志/链路追踪) 成 starter |
+| `@ConditionalOnClass(name="...")` 按 classpath 选激活 | 一个 jar 兼容 MVC + WebFlux 等场景, 按宿主项目自动选合适部分 |
+| `ThreadLocal` (`SecurityContextHolder`) 替代显式参数透传 | 解耦业务代码与 HTTP/RPC 细节, 业务层只关心"当前用户是谁" |
+| 进站 + 出站拦截器对称设计 | 认证信息在跨服务调用链里自动跟随, 业务代码 0 改动 |
+| 分清 MVC (HandlerInterceptor) 与 WebFlux (GlobalFilter) | 网关用 GlobalFilter, 业务服务用 HandlerInterceptor, 两套不互通 |
+
 ## 61.3  G3.8 没做但已铺路的 (后续)
 
 | 待办 | 何时做 |

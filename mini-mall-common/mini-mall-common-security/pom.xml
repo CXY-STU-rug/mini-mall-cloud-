@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- 父是 common 聚合层, 它再向上指向 mini-mall-cloud 拿 dependencyManagement -->
+    <parent>
+        <groupId>com.minimall</groupId>
+        <artifactId>mini-mall-common</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>mini-mall-common-security</artifactId>
+    <name>mini-mall-common-security</name>
+    <description>公共安全组件: JwtUtil + Header/Feign 拦截器 + 自动装配</description>
+
+    <dependencies>
+
+        <!-- ① common-core: 要用 SecurityContextHolder + StringUtils 之类 -->
+        <dependency>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-core</artifactId>
+        </dependency>
+
+        <!-- ② JWT 三件套 (跟 user 服务现在用的一样, 抽到这里就是为了去重)
+             api    = 编译期接口 (Jwts/Claims 类型在这里)
+             impl   = 运行期实现 (生成/解析的底层代码)
+             jackson = JSON 解析 payload 用 -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-impl</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-jackson</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- ③ Spring Web: HandlerInterceptor / WebMvcConfigurer 接口在这个包
+             provided 是因为业务服务自己肯定引了 spring-boot-starter-web, 不重复传递 -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-webmvc</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- ③b Servlet API: HttpServletRequest / HttpServletResponse 在这里
+             spring-webmvc 是 provided 不传递子依赖, 必须显式引一遍.
+             同样 provided, 业务服务自有 Tomcat 提供 -->
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- ④ OpenFeign: RequestInterceptor 接口在 feign-core
+             同样 provided, 只有用 Feign 的业务服务才会真正传递 -->
+        <dependency>
+            <groupId>io.github.openfeign</groupId>
+            <artifactId>feign-core</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- ⑤ Spring Boot AutoConfiguration: 让 @AutoConfiguration / @ConfigurationProperties 注解可用 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-autoconfigure</artifactId>
+        </dependency>
+
+        <!-- ⑥ Lombok: @Data / @Slf4j -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+    </dependencies>
+</project>

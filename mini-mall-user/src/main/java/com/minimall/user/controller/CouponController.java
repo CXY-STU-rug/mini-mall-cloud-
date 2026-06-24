@@ -1,5 +1,6 @@
 package com.minimall.user.controller;
 
+import com.minimall.common.core.context.SecurityContextHolder;
 import com.minimall.common.core.domain.Result;
 import com.minimall.user.dto.UseCouponDTO;
 import com.minimall.user.entity.Coupon;
@@ -50,9 +51,8 @@ public class CouponController {
     // ════════════════════════════════════════════════════════════
     @PostMapping("/{couponId}/receive")
     public Result<Void> receive(
-            @PathVariable Long couponId,
-            @RequestHeader("X-User-Id") Long userId
-    ) {
+            @PathVariable Long couponId
+    ) {Long userId= SecurityContextHolder.getUserId();
         couponService.receive(userId, couponId);
         return Result.success(null);
     }
@@ -61,7 +61,10 @@ public class CouponController {
     // ④ 我的券
     // ════════════════════════════════════════════════════════════
     @GetMapping("/mine")
-    public Result<List<UserCouponVO>> mine(@RequestHeader("X-User-Id") Long userId) {
+    public Result<List<UserCouponVO>> mine() {
+        // ⭐ SEC.10: 从 SecurityContextHolder 拿 userId, 不再用 @RequestHeader
+        //    HeaderInterceptor 已在请求进入时把 X-User-Id 头塞进 ThreadLocal
+        Long userId = SecurityContextHolder.getUserId();
         return Result.success(couponService.listMine(userId));
     }
 

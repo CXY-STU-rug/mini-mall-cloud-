@@ -1,5 +1,5 @@
 package com.minimall.user.service.impl;
-
+import com.minimall.common.security.util.JwtUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.minimall.common.core.exception.BusinessException;
@@ -8,7 +8,6 @@ import com.minimall.user.dto.UserRegisterDTO;
 import com.minimall.user.entity.User;
 import com.minimall.user.mapper.UserMapper;
 import com.minimall.user.service.IUserService;
-import com.minimall.user.util.JwtUtil;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;

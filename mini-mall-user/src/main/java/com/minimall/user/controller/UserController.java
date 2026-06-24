@@ -2,6 +2,7 @@ package com.minimall.user.controller;
 
 import com.alibaba.csp.sentinel.annotation.SentinelResource;
 import com.alibaba.csp.sentinel.slots.block.BlockException;
+import com.minimall.common.core.context.SecurityContextHolder;
 import com.minimall.common.core.domain.Result;
 import com.minimall.common.core.exception.BusinessException;
 import com.minimall.user.client.ProductFeignClient;
@@ -62,8 +63,7 @@ public class UserController {
     public Result<Map<String, Object>> me(
             // @RequestHeader("X-User-Id") —— 直接把 header 注入成方法参数
             // Spring 自动把 String 转成 Long（因为我们声明类型是 Long）
-            @RequestHeader("X-User-Id") Long userId
-    ) {
+    ) {Long userId= SecurityContextHolder.getUserId();
         // 打印到控制台，方便从启动窗口直接看到验证结果
         System.out.println("[user/me] 收到的 X-User-Id = " + userId);
 

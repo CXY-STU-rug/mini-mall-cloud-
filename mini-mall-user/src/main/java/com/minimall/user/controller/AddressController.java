@@ -1,6 +1,7 @@
 package com.minimall.user.controller;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.minimall.common.core.context.SecurityContextHolder;
 import com.minimall.common.core.domain.Result;
 import com.minimall.common.core.exception.BusinessException;
 import com.minimall.user.entity.Address;
@@ -21,12 +22,13 @@ import java.util.List;
  *   ③ Controller 调 UserContext.getUserId() 拿
  *   全程在同一 JVM, ThreadLocal 在同一个线程里通用
  *
- * ── 微服务 ────────────────────────────────────────────────
+ * ── 微服务 (SEC.10 重构后) ─────────────────────────────────
  *   ① 前端 Authorization: Bearer xxx → 【网关 9080】
  *   ② 网关 AuthGlobalFilter 解 token, 把 userId 写进 X-User-Id header
  *   ③ 转发到下游服务 (user-service:9001)
- *   ④ 下游 Controller 用 @RequestHeader("X-User-Id") Long userId 拿
- *   跨进程! ThreadLocal 用不了 (网关跟 user-service 是两个 JVM)
+ *   ④ HeaderInterceptor 自动把 X-User-Id 头塞进 SecurityContextHolder (ThreadLocal)
+ *   ⑤ Controller 调 SecurityContextHolder.getUserId() 拿 — 写法跟单体一样
+ *   微服务里 ThreadLocal 回来了, 但仅在 Controller 当前线程内有效
  *
  * 端点 (网关代理):
  *   GET    /user/address           → 我的地址列表
@@ -51,11 +53,8 @@ public class AddressController {
      * 排序: 默认地址置顶 → 再按创建时间倒序
      */
     @GetMapping
-    public Result<List<Address>> list(
-            // ⭐ 不用 UserContext 了, 直接从 header 拿
-            // 网关 AuthGlobalFilter 已经把它塞进来
-            @RequestHeader("X-User-Id") Long userId
-    ) {
+    public Result<List<Address>> list() {
+        Long userId = SecurityContextHolder.getUserId();
         QueryWrapper<Address> w = new QueryWrapper<>();
         w.eq("user_id", userId)                    // ⭐ 强制只查自己的
          .orderByDesc("is_default")                // 默认置顶
@@ -69,9 +68,10 @@ public class AddressController {
      */
     @GetMapping("/{id}")
     public Result<Address> detail(
-            @PathVariable Long id,
-            @RequestHeader("X-User-Id") Long userId
+            @PathVariable Long id
+
     ) {
+        Long userId= SecurityContextHolder.getUserId();
         return Result.success(getAndCheckOwn(id, userId));
     }
 
@@ -84,9 +84,9 @@ public class AddressController {
      */
     @PostMapping
     public Result<Address> create(
-            @RequestBody Address address,
-            @RequestHeader("X-User-Id") Long userId
+            @RequestBody Address address
     ) {
+        Long userId= SecurityContextHolder.getUserId();
         address.setUserId(userId);     // ⭐ 强制盖, 防伪造
         addressService.save(address);  // MP 自动回填自增 id
         return Result.success(address);
@@ -98,9 +98,9 @@ public class AddressController {
     @PutMapping("/{id}")
     public Result<Address> update(
             @PathVariable Long id,
-            @RequestBody Address address,
-            @RequestHeader("X-User-Id") Long userId
+            @RequestBody Address address
     ) {
+        Long userId= SecurityContextHolder.getUserId();
         // 先校验"这条 id 真是你的", 避免伪造别人的地址 id 改成自己的
         getAndCheckOwn(id, userId);
 
@@ -117,9 +117,9 @@ public class AddressController {
      */
     @DeleteMapping("/{id}")
     public Result<Void> delete(
-            @PathVariable Long id,
-            @RequestHeader("X-User-Id") Long userId
+            @PathVariable Long id
     ) {
+        Long userId= SecurityContextHolder.getUserId();
         getAndCheckOwn(id, userId);
         addressService.removeById(id);  // 实际执行 UPDATE ... SET is_deleted=1
         return Result.success();

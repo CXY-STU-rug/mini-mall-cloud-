@@ -1,5 +1,6 @@
 package com.minimall.order.controller;
 
+import com.minimall.common.core.context.SecurityContextHolder;
 import com.minimall.common.core.domain.Result;
 import com.minimall.order.dto.CreateOrderDTO;
 import com.minimall.order.dto.ShipOrderDTO;
@@ -15,7 +16,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 订单 Controller (G3.7 - 从单体搬, 改 UserContext → X-User-Id header)
+ * 订单 Controller (G3.7 搬, SEC.10 重构 → SecurityContextHolder)
  *
  * 端点 (网关代理 /order/** → mini-mall-order):
  *   POST   /order                 → 创建订单 (发延迟 MQ)
@@ -36,33 +37,36 @@ public class OrdersController {
     /** ① 创建订单 */
     @PostMapping
     public Result<Map<String, Object>> create(
-            @RequestBody CreateOrderDTO dto,
-            @RequestHeader("X-User-Id") Long userId
+            @RequestBody CreateOrderDTO dto
+
     ) {
+        Long userId= SecurityContextHolder.getUserId();
         return Result.success(ordersService.createOrder(userId, dto));
     }
 
     /** ② 我的订单列表 */
     @GetMapping("/my")
-    public Result<List<OrderListVO>> myOrders(@RequestHeader("X-User-Id") Long userId) {
+    public Result<List<OrderListVO>> myOrders() {
+        Long userId= SecurityContextHolder.getUserId();
         return Result.success(ordersService.listMyOrders(userId));
     }
 
     /** ③ 订单详情 */
     @GetMapping("/{orderId}")
     public Result<OrderDetailVO> detail(
-            @PathVariable Long orderId,
-            @RequestHeader("X-User-Id") Long userId
+            @PathVariable Long orderId
+
     ) {
+        Long userId= SecurityContextHolder.getUserId();
         return Result.success(ordersService.getOrderDetail(userId, orderId));
     }
 
     /** ④ 取消订单 */
     @PutMapping("/{orderId}/cancel")
     public Result<Void> cancel(
-            @PathVariable Long orderId,
-            @RequestHeader("X-User-Id") Long userId
+            @PathVariable Long orderId
     ) {
+        Long userId= SecurityContextHolder.getUserId();
         ordersService.cancelOrder(userId, orderId);
         return Result.success();
     }
@@ -70,9 +74,10 @@ public class OrdersController {
     /** ⑤ 标记付款 (本地模拟) */
     @PostMapping("/{orderId}/pay")
     public Result<Void> pay(
-            @PathVariable Long orderId,
-            @RequestHeader("X-User-Id") Long userId
+            @PathVariable Long orderId
+
     ) {
+        Long userId= SecurityContextHolder.getUserId();
         ordersService.payOrder(userId, orderId);
         return Result.success();
     }
@@ -84,7 +89,7 @@ public class OrdersController {
     //   - PUT /order/{orderId}/ship
     //   - @PathVariable Long orderId
     //   - @RequestBody @Valid ShipOrderDTO dto    ← 加 @Valid 才会触发 @NotBlank
-    //   - ❌ 不要 @RequestHeader("X-User-Id"), admin 操作不需要用户身份
+    //   - ❌ 不要调 SecurityContextHolder.getUserId(), admin 操作不需要用户身份
     //   - 调 ordersService.shipOrder(orderId, dto)
     //   - 返 Result.success()
     //
@@ -108,8 +113,9 @@ public class OrdersController {
 
 
     @PutMapping("/{orderId}/sign")
-    public Result<Void> sign( @RequestHeader("X-User-Id") Long userId,@PathVariable Long orderId)
-    {  ordersService.signOrder(userId, orderId);
+    public Result<Void> sign( @PathVariable Long orderId)
+    {  Long userId= SecurityContextHolder.getUserId();
+        ordersService.signOrder(userId, orderId);
         return Result.success();
 
     }

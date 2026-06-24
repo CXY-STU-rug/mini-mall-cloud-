@@ -22,7 +22,12 @@
     <description>商品评价服务: 用户对已完成订单里的商品打分 + 评分聚合回写</description>
 
     <dependencies>
-
+        <!-- ⭐ common-security: 自动从 X-User-Id 头部塞 SecurityContextHolder -->
+        <!--    Feign 调用时自动透传, 业务代码 0 配置 -->
+        <dependency>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-security</artifactId>
+        </dependency>
         <!-- ① 自家 common-core: Result / BusinessException / GlobalExceptionHandler -->
         <dependency>
             <groupId>com.minimall</groupId>

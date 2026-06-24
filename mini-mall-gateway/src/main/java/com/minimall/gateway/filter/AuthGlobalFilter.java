@@ -1,6 +1,6 @@
 package com.minimall.gateway.filter;
 
-import com.minimall.gateway.util.JwtUtil;
+import com.minimall.common.security.util.JwtUtil;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;

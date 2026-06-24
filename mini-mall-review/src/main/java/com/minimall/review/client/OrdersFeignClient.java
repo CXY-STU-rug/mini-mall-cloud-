@@ -5,7 +5,6 @@ import com.minimall.review.client.fallback.OrdersFeignClientFallback;
 import org.springframework.cloud.openfeign.FeignClient;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestHeader;
 
 import java.util.Map;
 
@@ -24,9 +23,10 @@ import java.util.Map;
  *   2. fallback=OrdersFeignClientFallback    → order 挂了走降级
  *   3. 方法签名跟 order 的 Controller 完全对齐 (path/method/header)
  * <p>
- * ⭐ 关键: 方法上加 @RequestHeader("X-User-Id"),
- *     Feign 调用时会把这个 header 真的发出去, order 那边 @RequestHeader 才能拿到.
- *     不加的话 order 会报 "Missing request header 'X-User-Id'" 400.
+ * ⭐ SEC.11 重构后: 不再需要 @RequestHeader 形参.
+ *     common-security 的 FeignAuthInterceptor 在每次 Feign 出站时
+ *     自动从 SecurityContextHolder 取 userId 塞 X-User-Id 头.
+ *     下游 order 的 HeaderInterceptor 同样会从头部读出来放进自己的 ThreadLocal.
  */
 @FeignClient(
         name = "mini-mall-order",
@@ -43,7 +43,6 @@ public interface OrdersFeignClient {
      */
     @GetMapping("/order/{orderId}")
     Result<Map<String, Object>> getOrderDetail(
-            @PathVariable("orderId") Long orderId,
-            @RequestHeader("X-User-Id") Long userId
+            @PathVariable("orderId") Long orderId
     );
 }

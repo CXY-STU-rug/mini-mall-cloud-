@@ -1,5 +1,6 @@
 package com.minimall.order.controller;
 
+import com.minimall.common.core.context.SecurityContextHolder;
 import com.minimall.common.core.domain.Result;
 import com.minimall.common.core.exception.BusinessException;
 import com.minimall.order.dto.AddCartDTO;
@@ -13,7 +14,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 购物车 Controller (从单体搬, 改 UserContext → @RequestHeader)
+ * 购物车 Controller (G3.4 从单体搬, SEC.10 改用 SecurityContextHolder)
  *
  * 端点 (网关代理 /cart/** → mini-mall-order):
  *   GET    /cart           → 我的购物车 (含商品详情)
@@ -35,7 +36,8 @@ public class CartItemController {
      *      因为前端要的是【组合数据】(cart 自己 + 商品详情)
      */
     @GetMapping
-    public Result<List<CartItemVO>> myCart(@RequestHeader("X-User-Id") Long userId) {
+    public Result<List<CartItemVO>> myCart() {
+        Long userId= SecurityContextHolder.getUserId();
         return Result.success(cartItemService.listMyCart(userId));
     }
 
@@ -45,8 +47,10 @@ public class CartItemController {
      * 单体里没 @RequestBody, 这里加上 (前端发 JSON)
      */
     @PostMapping
-    public Result<Void> add(@RequestBody AddCartDTO dto,
-                            @RequestHeader("X-User-Id") Long userId) {
+    public Result<Void> add(@RequestBody AddCartDTO dto)
+
+    {
+        Long userId= SecurityContextHolder.getUserId();
         cartItemService.addToCart(userId, dto.getProductId(), dto.getQuantity());
         return Result.success();
     }
@@ -63,9 +67,10 @@ public class CartItemController {
     @PutMapping("/{id}")
     public Result<Void> updateQuantity(
             @PathVariable Long id,
-            @RequestBody Map<String, Integer> body,
-            @RequestHeader("X-User-Id") Long userId
+            @RequestBody Map<String, Integer> body
+
     ) {
+        Long userId= SecurityContextHolder.getUserId();
         // 越权校验: 这条 cart 是不是你的
         CartItem item = getAndCheckOwn(id, userId);
 
@@ -83,8 +88,9 @@ public class CartItemController {
      * ④ 删除
      */
     @DeleteMapping("/{id}")
-    public Result<Void> delete(@PathVariable Long id,
-                               @RequestHeader("X-User-Id") Long userId) {
+    public Result<Void> delete(@PathVariable Long id
+                             ) {
+        Long userId= SecurityContextHolder.getUserId();
         getAndCheckOwn(id, userId);
         cartItemService.removeById(id);    // 逻辑删除 (因 @TableLogic)
         return Result.success();

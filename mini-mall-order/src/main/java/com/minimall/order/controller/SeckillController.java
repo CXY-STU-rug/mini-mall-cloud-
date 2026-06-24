@@ -1,5 +1,6 @@
 package com.minimall.order.controller;
 
+import com.minimall.common.core.context.SecurityContextHolder;
 import com.minimall.common.core.domain.Result;
 import com.minimall.order.dto.SeckillActivityDTO;
 import com.minimall.order.service.ISeckillActivityService;
@@ -41,18 +42,18 @@ public class SeckillController {
     /** ③ ⭐ 抢购核心入口 */
     @PostMapping("/{activityId}")
     public Result<String> seckill(
-            @PathVariable Long activityId,
-            @RequestHeader("X-User-Id") Long userId
+            @PathVariable Long activityId
     ) {
+        Long userId= SecurityContextHolder.getUserId();
         return Result.success(seckillActivityService.seckill(userId, activityId));
     }
 
     /** ④ 查我的秒杀结果 (前端轮询用, 一般 1 秒一次) */
     @GetMapping("/result/{activityId}")
     public Result<Map<String, Object>> queryResult(
-            @PathVariable Long activityId,
-            @RequestHeader("X-User-Id") Long userId
+            @PathVariable Long activityId
     ) {
+        Long userId= SecurityContextHolder.getUserId();
         return Result.success(seckillActivityService.querySeckillResult(userId, activityId));
     }
 }

@@ -79,25 +79,12 @@
             <artifactId>lombok</artifactId>
             <optional>true</optional>
         </dependency>
-
-        <!-- ⑥ JWT 三件套（jjwt-api/impl/jackson）
-             版本在根 pom dependencyManagement 锁好 0.12.6
-             api    = 编译要用的接口
-             impl   = 运行时实现（runtime）
-             jackson= JSON 序列化（runtime） -->
+        <!-- ⭐ common-security: JwtUtil + HeaderInterceptor + FeignAuthInterceptor -->
+        <!--    自动配置 SecurityContextHolder, 自动在 Feign 请求里透传 X-User-Id -->
+        <!--    JJWT 三件套已经通过 common-security 传递进来, 这里不用再写 -->
         <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-api</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-impl</artifactId>
-            <scope>runtime</scope>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-jackson</artifactId>
-            <scope>runtime</scope>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-security</artifactId>
         </dependency>
 
         <!-- ⑦ Spring Security 的 BCrypt 密码加密

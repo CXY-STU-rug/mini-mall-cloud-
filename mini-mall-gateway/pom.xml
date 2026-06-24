@@ -32,21 +32,11 @@
             <groupId>com.minimall</groupId>
             <artifactId>mini-mall-common-core</artifactId>
         </dependency>
-
-        <!-- ③ JWT 三件套（D3 步骤 GlobalFilter 解 token 要用） -->
+        <!-- ⭐ common-security: 复用 JwtUtil(网关解 token) -->
+        <!--    common-security 里 WebMvcConfig 加了 @ConditionalOnClass, gateway 是 WebFlux 不会冲突 -->
         <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-api</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-impl</artifactId>
-            <scope>runtime</scope>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-jackson</artifactId>
-            <scope>runtime</scope>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-security</artifactId>
         </dependency>
 
         <!-- ⭐ F2.7 新增：Sentinel Gateway 适配器
