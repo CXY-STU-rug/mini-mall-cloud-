@@ -47,7 +47,7 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
      */
     private static final List<String> WHITE_LIST = List.of(
             // 登录/注册
-            "/user/login", "/user/register",
+            "/user/login", "/user/register",  "/user/oauth",
             // G3.1: 商品分类对游客也可见 (列表/详情)
             // 注: startsWith 会把 POST/PUT/DELETE 也放过, 教学项目暂不区分
             //     生产环境应该用 method + path 双维度白名单

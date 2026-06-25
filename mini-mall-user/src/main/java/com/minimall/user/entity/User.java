@@ -63,4 +63,9 @@ public class User implements Serializable {
     /** 逻辑删除标记，0=未删除 1=已删除 */
     @TableLogic
     private Byte isDeleted;
+    /** OAuth 来源: github / wechat / null=本地账号 */
+    private String oauthProvider;
+
+    /** OAuth 平台返回的用户唯一 id (GitHub 是数字, 微信是 openid) */
+    private String oauthId;
 }
