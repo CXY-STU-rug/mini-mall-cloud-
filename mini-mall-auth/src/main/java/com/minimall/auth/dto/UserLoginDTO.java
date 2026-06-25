@@ -1,15 +1,10 @@
-package com.minimall.user.dto;
+package com.minimall.auth.dto;
 
 import jakarta.validation.constraints.NotBlank;
 import lombok.Data;
 
 /**
- * 登录入参 DTO
- *
- * 加 @NotBlank 校验：
- *   - 空串 / null / 全空格 都会被拒
- *   - 失败时会抛 MethodArgumentNotValidException
- *     → GlobalExceptionHandler 接住后返 400 + 字段名+原因
+ * 登录入参 DTO (从 user 服务搬过来, 只改包名)
  */
 @Data
 public class UserLoginDTO {

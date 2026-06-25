@@ -1,0 +1,15 @@
+# ═══════════════════════════════════════════════════════════
+# bootstrap.yml — Spring Cloud 启动期最早读的配置
+# auth 服务 (从 user 抽出来, 跟其它服务一样接 Nacos Config)
+# ═══════════════════════════════════════════════════════════
+spring:
+  application:
+    name: mini-mall-auth
+
+  cloud:
+    nacos:
+      config:
+        server-addr: 127.0.0.1:8848
+        file-extension: yaml
+        group: DEFAULT_GROUP
+        namespace: public

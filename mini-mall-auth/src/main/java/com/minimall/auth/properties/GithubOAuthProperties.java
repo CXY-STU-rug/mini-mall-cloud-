@@ -1,17 +1,15 @@
-package com.minimall.user.properties;
+package com.minimall.auth.properties;
 
 import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 /**
- * GitHub OAuth2 配置
+ * GitHub OAuth2 配置 (从 user 服务搬到 auth 服务, 包名变了, 内容不变)
  *
- * 把 application.yml 里 oauth.github.* 段绑到本类。
- *
- * 命名约定:
- *   yml:  oauth.github.client-id          (kebab-case 连字符)
- *   Java: this.clientId                   (camelCase 驼峰)
+ * 把 application.yml 里 oauth.github.* 段绑到本类.
+ *   yml:  oauth.github.client-id          (kebab-case)
+ *   Java: this.clientId                   (camelCase)
  *   Spring Boot 自动映射, 不用我们干啥
  */
 @Data
@@ -28,12 +26,12 @@ public class GithubOAuthProperties {
     /** OAuth 回调地址, 必须跟 GitHub OAuth App 注册时填的一致 */
     private String callbackUrl;
 
-    /** GitHub 授权页 URL: 用户跳转到这里同意授权 */
+    /** GitHub 授权页 URL */
     private String authorizeUrl;
 
-    /** GitHub 拿 token 的 URL: 后端用 code 换 token */
+    /** GitHub 拿 token 的 URL */
     private String tokenUrl;
 
-    /** GitHub 拿用户信息的 URL: 用 token 查用户 */
+    /** GitHub 拿用户信息的 URL */
     private String userInfoUrl;
 }

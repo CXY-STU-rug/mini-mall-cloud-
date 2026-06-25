@@ -37,6 +37,8 @@
         <module>mini-mall-review</module>
         <!-- G9 商品搜索服务，重新做时再解开-->
         <module>mini-mall-search</module>
+        <!-- ⭐ AUTH 阶段：抽 login/register/OAuth 出来 → 独立认证服务 -->
+        <module>mini-mall-auth</module>
 
     </modules>
 

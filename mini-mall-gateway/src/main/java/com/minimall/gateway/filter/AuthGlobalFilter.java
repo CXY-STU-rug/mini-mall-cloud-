@@ -46,8 +46,8 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
      *   写法：List.of("/user/login", "/user/register")
      */
     private static final List<String> WHITE_LIST = List.of(
-            // 登录/注册
-            "/user/login", "/user/register",  "/user/oauth",
+            // ⭐ AUTH 阶段: 认证服务整段放行 (login/register/oauth 全在 /auth/** 下)
+            "/auth",
             // G3.1: 商品分类对游客也可见 (列表/详情)
             // 注: startsWith 会把 POST/PUT/DELETE 也放过, 教学项目暂不区分
             //     生产环境应该用 method + path 双维度白名单
@@ -58,12 +58,29 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
             "/coupon/available"
     );
 
+    /**
+     * 黑名单: 这些 path 直接 403, 不允许外部访问
+     *
+     * AUTH 阶段加 /user/internal/**: 这是 mini-mall-auth 服务调 user 服务的 internal 接口,
+     * 返回 password 密文等敏感数据, 只能在服务间走 Feign (Nacos 直连 :9001), 绝不能通过网关给外部.
+     */
+    private static final List<String> BLACK_LIST = List.of(
+            "/user/internal"
+    );
+
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
 
         // 拿到当前请求对象
         ServerHttpRequest request = exchange.getRequest();
         String path = request.getURI().getPath();
+
+        // ⭐ 黑名单先判: internal 接口绝不让外部访问
+        boolean inBlackList = BLACK_LIST.stream().anyMatch(path::startsWith);
+        if (inBlackList) {
+            exchange.getResponse().setStatusCode(HttpStatus.FORBIDDEN);
+            return exchange.getResponse().setComplete();
+        }
 
         // ⭐ TODO ②：判断当前 path 是否在白名单
         //   如果在 → 直接放行（return chain.filter(exchange);）

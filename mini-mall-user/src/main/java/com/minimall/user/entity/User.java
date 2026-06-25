@@ -3,7 +3,6 @@ package com.minimall.user.entity;
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableLogic;
-import com.fasterxml.jackson.annotation.JsonIgnore;
 import lombok.Getter;
 import lombok.Setter;
 
@@ -35,8 +34,11 @@ public class User implements Serializable {
 
     private String username;
 
-    /** 密码 BCrypt 加密后存的，永远不返前端 */
-    @JsonIgnore
+    /**
+     * 密码 BCrypt 加密后存.
+     * ⚠️ AUTH 阶段移除 @JsonIgnore: internal 接口 (/user/internal/**) 要序列化 password 给 auth 服务.
+     * 对外端点 (UserController) 返 User 时必须显式 setPassword(null) 兜底, 见 UserController.getById / with-product.
+     */
     private String password;
 
     private String nickname;

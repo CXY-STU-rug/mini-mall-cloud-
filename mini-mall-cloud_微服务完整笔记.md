@@ -608,6 +608,13 @@
   - [78.4  踩坑实录 (8 大坑)](#sec704)
   - [78.5  📄 Java 通用知识深挖 (独立 docx)](#sec705)
   - [78.6  本轮累计能力](#sec706)
+- [Chapter 79 · AUTH 阶段 · 抽认证服务 mini-mall-auth](#sec800)
+  - [79.1  这次做了什么 (1 句话)](#sec801)
+  - [79.2  抽完后的服务架构图](#sec802)
+  - [79.3  internal 接口模式 (auth 不直连 DB, Feign 调 user)](#sec803)
+  - [79.4  踩坑实录 (5 大坑)](#sec804)
+  - [79.5  端到端验证 (6/6 通过)](#sec805)
+  - [79.6  本轮累计能力 + 设计反思](#sec806)
 
 
 # 微服务基础知识点 <a id="sec001"></a>
@@ -18970,3 +18977,155 @@ http://localhost:9080/.../callback?access_token=gho_xxxxxxxxxxxx
 下一步可选: ① 微信/支付宝 OAuth 复用同套模板 ② 前端 Vue3 集成 GitHub 登录按钮 ③ `/user/me` 接口加完整资料 (目前只返 userId)
 
 **common-swagger 完毕**. mini-mall-cloud 至此基础库 3/4: **core / redis / swagger**, 只剩 common-security 抽鉴权. 业务 100% + 文档统一, 项目"能展示" + "能讲清楚架构".
+---
+
+# Chapter 79 · AUTH 阶段 · 抽认证服务 mini-mall-auth <a id="sec800"></a>
+
+## 79.1  这次做了什么 (1 句话) <a id="sec801"></a>
+
+把分散在 user 服务里的【本地登录 / 注册 / OAuth】三件套统一抽到独立微服务 **mini-mall-auth** (端口 9006), user 服务从此只管 user 表 CRUD, 不碰认证业务.
+
+> 接 Chapter 78 OAUTH 阶段的尾声 — 当时为了快速跑通 OAuth 验证可行性, 把 OAuthController 临时放在 user 服务里. 本章把架构修正到位.
+
+## 79.2  抽完后的服务架构图 <a id="sec802"></a>
+
+```
+                 浏览器 / 前端
+                       │
+                       ▼
+            ┌──────────────────────┐
+            │  mini-mall-gateway   │  :9080
+            │  WHITE_LIST: /auth   │  ← 整段放行 (login/register/oauth)
+            │  BLACK_LIST: /user/internal  ← 403, 外部不可达
+            └──────────────────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+ ┌──────────────┐ ┌────────────┐ ┌──────────────────┐
+ │ mini-mall-   │ │ user :9001 │ │ product/order/..│
+ │ auth :9006   │ │            │ │                  │
+ │              │ │ ├ /user/me │ │                  │
+ │ /auth/login  │ │ ├ /user/{id}│ │                  │
+ │ /auth/register│ │ ├ /user/internal/* ← 仅 Feign 入│
+ │ /auth/oauth/*│ │            │ │                  │
+ │ (有 JwtUtil) │ │            │ │                  │
+ └──────┬───────┘ └────▲───────┘ └──────────────────┘
+        │              │
+        │   Feign      │
+        │   ──────────►│  GET  /user/internal/by-username/{name}
+        │              │  GET  /user/internal/by-oauth/{prov}/{id}
+        │              │  POST /user/internal             (新建)
+        │              │
+        └──────────────┘
+```
+
+**端口分配**:gateway 9080 / user 9001 / product 9002 / order 9003 / review 9004 / search 9005 / **auth 9006** (新).
+
+**Sentinel client 端口**:user 8719 / gateway 8721 / **auth 8720** (新, 不能撞).
+
+## 79.3  internal 接口模式 (auth 不直连 DB, Feign 调 user) <a id="sec803"></a>
+
+抽服务最经典的设计选择题 — **auth 怎么访问 user 表?**
+
+| 方案 | 做法 | 选不选 |
+|---|---|---|
+| A | auth 自己连 MySQL, 自己有 UserMapper | ❌ 破"一服务一表"原则, 出 bug 难定位 |
+| **B** ✅ | auth 通过 Feign 调 user 服务 internal 接口 | 干净, 可复用, 学到 internal 模式 |
+| C | 把 user 表抽到独立 DB 服务 | 过度设计, 跳过 |
+
+**internal 接口设计要点**:
+
+1. **路径前缀 `/user/internal/`** — 跟业务接口 `/user/{id}` 区分, 一眼能看出 "这是给服务间调的"
+2. **网关黑名单** — `AuthGlobalFilter` 加 `BLACK_LIST = ["/user/internal"]`, startsWith 匹配直接返 403, **外部绝对调不到**
+3. **Feign 不走网关** — auth → user 走 Nacos 直连 (`lb://mini-mall-user`), 不经过网关, 所以 internal 接口对 auth 可达, 对外部不可达
+4. **返 `Result<User>` 不抛 404** — 查不到返 `Result.success(null)`, 让 auth 自己判 null 决定 "用户不存在" 或 "首次 OAuth 建账号"
+
+3 个端点 (`UserInternalController`):
+
+```java
+GET  /user/internal/by-username/{name}      // 本地登录用 (含 password 密文)
+GET  /user/internal/by-oauth/{prov}/{id}    // OAuth 回调用
+POST /user/internal                          // 注册 / OAuth 首次 (回填 id)
+```
+
+auth 这边的 `UserFeignClient` 三方法一一对应, 加 fallback 返 `Result.error(503, "用户服务暂不可用")` 区分 "user 服务挂了" vs "用户不存在".
+
+## 79.4  踩坑实录 (5 大坑) <a id="sec804"></a>
+
+### 坑 1: `@JsonIgnore` 在 password 字段上, Feign 跨服务密文丢失
+
+`user.entity.User.password` 原来加了 `@JsonIgnore` (防泄密码到前端). 但抽 auth 后:
+
+- **注册**: auth 算 BCrypt 密文 → Feign POST `/user/internal` 序列化 User → `@JsonIgnore` 把 password 跳过 → user 服务收到 password = null → 入库密码为空 ❌
+- **登录**: user internal 返 User → 序列化跳过 password → auth 拿不到密文比对 ❌
+
+**修复**:
+- 拿掉 `entity.User.password` 上的 `@JsonIgnore`
+- auth.model.User.password 也不能加 `@JsonIgnore`
+- **改为兜底方案**: Controller 在返给前端前 **手动** `user.setPassword(null)`
+  - auth 的 `AuthController` 两处, `OAuthController` 一处
+  - user 服务的 `UserController.getById` / `with-product` 两处
+
+设计权衡: **从"框架自动兜底" 退化到 "调用方手动兜底"**. 因为跨服务序列化反而需要密文流通, `@JsonIgnore` 不再适合.
+
+### 坑 2: fat jar 改 yml 不重新打包不生效
+
+抽完 auth 第一次启动 → `Port 8080 was already in use` (Spring Boot 默认端口).
+
+原因: `application.yml` 是 mvn package **之后** 才 `cp .example .yml` 的, 这次拷贝的文件**不在 jar 里**. Spring Boot 读 classpath 找不到 `server.port: 9006`, 默认 8080, 撞了别的进程.
+
+**修复**: 重新 `mvn package`, 让 yml 进 jar; 或把 yml 放 jar 同目录 (Boot 会从 `file:./application.yml` 加载, 优先级高于 classpath).
+
+教训: **改 src/main/resources 下任何配置都得重新打包**. 这是 fat jar 模型的天然代价, 单体 web 容器不存在这个坑 (因为是直接读 webapps/ 下的 classes/).
+
+### 坑 3: 网关 application.yml 加路由但 jar 没重打
+
+跟坑 2 同根源. AUTH.12 我改了 `gateway/application.yml.example` 加 `auth-route`, 但用户的真实 `application.yml` 改了, jar 没重打, 启动后 auth-route 不存在 → 所有 `/auth/**` 返 404.
+
+教训: 抽服务必须**网关 yml 一改就重打 gateway**, 否则路由表脱节.
+
+### 坑 4: Sentinel client port 必须错开
+
+auth 的 `application.yml` 一开始抄了 user 的 `transport.port: 8719`, 跑起来跟 user 撞了 (本机多服务时一台机器开多个 Sentinel client). 改成 8720 (跟 user 的 8719 / gateway 的 8721 都不同).
+
+教训: 本机部署多个服务, **Sentinel client 端口规划要跟服务端口一样提前定**.
+
+### 坑 5: `cp application.yml.example application.yml` 容易漏
+
+抽服务流程一长, AUTH.13 里 5 件手动事用户漏了 2 件: yml 没复制, gateway 路由没加. 导致 auth 启动撞端口 + gateway 路由 404.
+
+教训: 抽服务的检查清单要明确**列出每个 src/main/resources 下要建的文件名**, 否则 `.example` 文件常被忽略.
+
+## 79.5  端到端验证 (6/6 通过) <a id="sec805"></a>
+
+跑了 6 项, 全过:
+
+```
+✅ POST /auth/register                注册新本地账号, userId 回填, token 签出, password 兜底 null
+✅ POST /auth/login                   同账号登录, 验证 BCrypt 比对走通
+✅ GET  /user/me                      JWT → 网关解 → X-User-Id 透传到 user 服务 (跨服务身份)
+✅ GET  /user/internal/by-username    外部访问被网关黑名单 403 (internal 不可达)
+✅ GET  /auth/oauth/github/login      授权页 URL 拼对 (client_id + redirect_uri)
+✅ 浏览器走完 GitHub OAuth → callback  4 步全通, 返 AuthResponse(token, user)
+```
+
+OAuth 浏览器流程验证了 `userFeignClient.getByOauth("github", oauthId)` 链路 (查到旧 OAuth 用户 → 直接签 JWT), 本地注册验证了 `userFeignClient.createUser(user)` 链路 (新 userId=7).
+
+## 79.6  本轮累计能力 + 设计反思 <a id="sec806"></a>
+
+| 抽出来后多了的能力 | 说明 |
+|---|---|
+| **服务边界清晰** | user 不再"既管用户表又管认证", auth 单一职责 |
+| **认证服务可独立扩展** | 加微信/支付宝 OAuth 只改 auth, 不动 user |
+| **internal 接口模式** | 后续 product/order 要操作 user 也走同款 internal + Feign + 网关黑名单 |
+| **跨服务密文流通** | `@JsonIgnore` → "调用方手动兜底", 是抽服务后绕不开的模式 |
+
+**设计反思** — 抽服务时 3 个问题想清再动:
+
+1. **新服务连不连库?** — 不连最干净, 但要确认能不能容忍 Feign 一跳的延迟 (auth 每次登录都多一次内网调用)
+2. **internal 接口怎么防外部?** — 网关黑名单 + Feign 不走网关 = 双层保护. 真生产环境再加 "调用方身份校验" (验 X-Service-Name 之类)
+3. **`@JsonIgnore` 等"框架自动兜底"在跨服务时还成立吗?** — 不一定. 抽服务前要扫一遍 entity 上的注解, 哪些跟跨服务传输冲突, 提前定方案
+
+---
+
+**AUTH 阶段完毕**. mini-mall-cloud 至此**认证业务独立成服务**, 微服务架构进一步合理化. 下一步可选: ① 微信/支付宝 OAuth 复用 auth ② 抽 `user-api` 模块解决 `model.User` 重复定义 ③ 给 internal 接口加调用方身份校验 (X-Service-Name)

@@ -1,0 +1,61 @@
+# ═══════════════════════════════════════════════════════════
+# mini-mall-auth 认证服务配置 (示例 / 模板)
+# 用法: cp application.yml.example application.yml , 然后填自己的密钥
+# 注意: 没有 datasource! auth 不连 MySQL, 通过 Feign 调 user 服务
+# ═══════════════════════════════════════════════════════════
+
+server:
+  # 端口规划: gateway 9080 / user 9001 / product 9002 / order 9003
+  #         review 9004 / search 9005 / auth 9006 (新)
+  port: 9006
+
+spring:
+  application:
+    name: mini-mall-auth
+
+  cloud:
+    # ⭐ Nacos 服务发现 (auth 既要注册自己, 也要靠它发现 user 服务给 Feign 用)
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+    # ⭐ Sentinel (跟 user 一样)
+    sentinel:
+      transport:
+        dashboard: 127.0.0.1:8858
+        port: 8720    # ⚠️ 跟 user 的 8719 错开 (本机多服务时 Sentinel client 端口不能撞)
+      eager: true
+
+# ─── Feign 接入 Sentinel 让 @FeignClient(fallback=) 生效 ─
+feign:
+  sentinel:
+    enabled: true
+
+# ═══════════════════════════════════════════════════════════
+# ⭐ JWT 配置 (必须跟 user / gateway 三家用【同一个 secret】, 不然签出来的 token 互验不通过)
+# ═══════════════════════════════════════════════════════════
+jwt:
+  secret: YOUR_JWT_SECRET_AT_LEAST_32_BYTES_LONG   # ⭐ 改这里 (复制 user 服务的 secret)
+  expiration: 604800000   # 7 天
+
+# ═══════════════════════════════════════════════════════════
+# ⭐ OAuth2 第三方登录配置 (从 user 服务搬过来, callback-url 路径改 /auth 前缀)
+# 1) 浏览器打开 https://github.com/settings/developers
+# 2) 找到原来那个 OAuth App, Authorization callback URL 改成 callback-url 的值
+#    (从 /user/oauth/github/callback 改成 /auth/oauth/github/callback)
+# 3) 不用重新生成 secret, 复用 user 那边的值即可
+# ═══════════════════════════════════════════════════════════
+oauth:
+  github:
+    client-id: YOUR_GITHUB_CLIENT_ID                # ⭐ 改这里
+    client-secret: YOUR_GITHUB_CLIENT_SECRET        # ⭐ 改这里
+    # 必须跟 GitHub OAuth App 里填的 callback URL【完全一致】
+    callback-url: http://localhost:9080/auth/oauth/github/callback
+    authorize-url: https://github.com/login/oauth/authorize
+    token-url: https://github.com/login/oauth/access_token
+    user-info-url: https://api.github.com/user
+
+logging:
+  level:
+    com.minimall: debug
+    root: info

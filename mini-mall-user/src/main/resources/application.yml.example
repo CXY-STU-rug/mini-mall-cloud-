@@ -64,22 +64,8 @@ jwt:
   secret: YOUR_JWT_SECRET_AT_LEAST_32_BYTES_LONG   # ⭐ 改这里
   expiration: 604800000   # 7 天
 
-# ═══════════════════════════════════════════════════════════
-# ⭐ OAuth2 第三方登录配置 (OAUTH 阶段新增)
-# client-id 公开, 直接填; client-secret 私密, 自己去 GitHub 生成
-# 1) 浏览器打开 https://github.com/settings/developers
-# 2) New OAuth App, Authorization callback URL 必须填 callback-url 的值
-# 3) Generate a new client secret, 立即复制贴到下面 (secret 只显示一次!)
-# ═══════════════════════════════════════════════════════════
-oauth:
-  github:
-    client-id: YOUR_GITHUB_CLIENT_ID                # ⭐ 改这里
-    client-secret: YOUR_GITHUB_CLIENT_SECRET        # ⭐ 改这里
-    # 必须跟 GitHub OAuth App 里填的 callback URL【完全一致】
-    callback-url: http://localhost:9080/user/oauth/github/callback
-    authorize-url: https://github.com/login/oauth/authorize
-    token-url: https://github.com/login/oauth/access_token
-    user-info-url: https://api.github.com/user
+# ⚠️ OAuth 配置 (AUTH 阶段已移到 mini-mall-auth 服务)
+#    user 服务不再需要 oauth.github.*, 见 mini-mall-auth/src/main/resources/application.yml.example
 
 logging:
   level:

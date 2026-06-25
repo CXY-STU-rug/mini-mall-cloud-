@@ -22,6 +22,13 @@ spring:
 
     gateway:
       routes:
+        # ─── AUTH 阶段新增: 认证服务 ─────────────
+        # /auth/login, /auth/register, /auth/oauth/** 全走 mini-mall-auth
+        - id: auth-route
+          uri: lb://mini-mall-auth
+          predicates:
+            - Path=/auth/**
+
         # ─── user 服务 ─────────────────────────
         - id: user-route
           uri: lb://mini-mall-user

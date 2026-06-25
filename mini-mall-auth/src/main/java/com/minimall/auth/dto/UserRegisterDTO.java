@@ -1,13 +1,11 @@
-package com.minimall.user.dto;
+package com.minimall.auth.dto;
 
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import lombok.Data;
 
 /**
- * 注册入参 DTO
- *
- * 比单体多了校验注解（demo 用，正式项目还要加手机号正则、邮箱格式等）
+ * 注册入参 DTO (从 user 服务搬过来, 只改包名)
  */
 @Data
 public class UserRegisterDTO {
