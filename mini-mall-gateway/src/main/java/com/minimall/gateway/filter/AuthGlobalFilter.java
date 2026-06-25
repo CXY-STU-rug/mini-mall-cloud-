@@ -112,20 +112,29 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
         // ← 改成解析的结果
 
         Long userId;
+        Byte role;
         try {
             userId = jwtUtil.getUserIdFromToken(token);
+            role = jwtUtil.getRoleFromToken(token);   // ADMIN 阶段: 一并拿 role
         } catch (Exception e) {
             return unauthorized(exchange);
         }
 
+        // ⭐ ADMIN 阶段: /admin/** 后台接口必须 role=1
+        //   防止普通用户拿到 token 后直接调 /admin/user/page 等接口
+        //   老 token 没有 role claim (返回 null) → 也按非管理员处理 → 用户重新登录拿新 token
+        if (path.startsWith("/admin/")) {
+            if (role == null || role.intValue() != 1) {
+                exchange.getResponse().setStatusCode(HttpStatus.FORBIDDEN);
+                return exchange.getResponse().setComplete();
+            }
+        }
 
-        // ⭐ TODO ⑤：把 userId 塞进 X-User-Id header 透传给下游
-        //   提示：request.mutate().header("X-User-Id", String.valueOf(userId)).build()
-        //   然后再用 exchange.mutate().request(mutated).build()
-        //   最后调 chain.filter(...)  让请求继续走
-
-        // [你的代码：return chain.filter(...)]
-        ServerHttpRequest mutated= request.mutate().header("X-User-Id", String.valueOf(userId)).build();
+        // 把 userId + role 都塞 header 透传给下游 (下游业务也可以基于 role 做精细控制)
+        ServerHttpRequest mutated = request.mutate()
+                .header("X-User-Id", String.valueOf(userId))
+                .header("X-User-Role", role == null ? "0" : String.valueOf(role))
+                .build();
         return chain.filter(exchange.mutate().request(mutated).build());
     }
 

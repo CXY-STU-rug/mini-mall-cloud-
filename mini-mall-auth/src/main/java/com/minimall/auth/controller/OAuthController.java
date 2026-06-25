@@ -158,8 +158,8 @@ public class OAuthController {
                 user = createResp.getData();   // user 服务回填的 id
             }
 
-            // ─── 步骤 4: 签 mini-mall 自家 JWT ──────────────────────────
-            String token = jwtUtil.generateToken(user.getId(), user.getUsername());
+            // ─── 步骤 4: 签 mini-mall 自家 JWT (ADMIN 阶段: role 一起塞) ──
+            String token = jwtUtil.generateToken(user.getId(), user.getUsername(), user.getRole());
             user.setPassword(null);    // 兜底 (OAuth 用户密码本来就 null, 但保险起见)
             return Result.success(new AuthResponse(token, user));
 

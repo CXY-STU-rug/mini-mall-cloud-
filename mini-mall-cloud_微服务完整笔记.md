@@ -78,6 +78,14 @@
   - [18.5 逻辑删除：MP 自动重写 SQL](#sec064)
   - [18.6 UserController 简单查询接口](#sec065)
   - [18.7 Mapper 依赖注入易错点速查](#sec066)
+  - [18.8 MyBatis 分页三大方案对比](#sec066-8)
+  - [18.9 本项目方案：MyBatis-Plus 分页实战](#sec066-9)
+    - [18.9.6 完整端到端 demo（ADMIN.3 用户管理实例）](#sec066-9-6)
+  - [18.10 原生方案 vs PageHelper 对照 demo](#sec066-10)
+  - [18.11 ADMIN.5 真踩坑：order 服务漏配 PaginationInnerInterceptor](#sec066-11)
+  - [18.12 深分页性能 + 优化方案](#sec066-12)
+  - [18.13 #{} vs ${} 与 @Param 速查（分页高频考点）](#sec066-13)
+  - [18.14 第十八章分页知识地图（一页脑图）](#sec066-14)
 - [十九、登录注册与 JWT 鉴权](#sec067)
   - [19.0 B 阶段文件清单（新建 / 修改）](#sec068)
   - [19.1 这一节做了哪 8 件事](#sec069)
@@ -2177,6 +2185,749 @@ public class UserController {
 | @MapperScan 和 @Mapper 必须二选一吗 | 一个就行，加 @MapperScan 更清爽 |
 | 逻辑删除后能用 selectById 查到吗 | 查不到（MP 自动加 AND is_deleted=0 过滤） |
 | @JsonIgnore 影响 SELECT 吗 | 不影响（SQL 查出来了，序列化时跳过） |
+
+### 18.8 MyBatis 分页三大方案对比 <a id="sec066-8"></a>
+
+MyBatis 生态里实现分页有三种主流方案，本项目用的是第 ③ 种（MP 内置）。
+
+| 方案 | 谁来加 LIMIT | 谁来 count | 何时用 |
+|---|---|---|---|
+| ① **原生手写 LIMIT** | 你在 XML/@Select 里手动写 `LIMIT #{offset},#{size}` | 自己写第二条 `SELECT COUNT(*)` | 极简 demo、不想引插件 |
+| ② **PageHelper 插件** | 插件拦截器自动拼 | 插件自动跑 count | 用纯 MyBatis 的项目（无 MP） |
+| ③ **MyBatis-Plus PaginationInnerInterceptor** | 插件自动拼 | 自动跑 count | **本项目方案**（已经在用 MP） |
+
+**核心区别一句话**：原生方案你写两条 SQL；插件方案（PageHelper / MP）你只写普通查询，插件**运行时拦截**生成的 SQL 加上 LIMIT 并执行 count。
+
+> 同时引入 PageHelper 和 MP 的分页插件会**互相打架**（两套拦截器都改 SQL，结果错乱）。本项目只用 MP，不要再引 PageHelper。
+
+### 18.9 本项目方案：MyBatis-Plus 分页实战 <a id="sec066-9"></a>
+
+#### 18.9.1 三步配齐（user / product / order 都是这套）
+
+**Step 1：pom 加依赖**（MP 3.5.9+ 必须）
+
+```xml
+<!-- MP 3.5.9+ 把 PaginationInnerInterceptor 拆到了 jsqlparser 包 -->
+<dependency>
+    <groupId>com.baomidou</groupId>
+    <artifactId>mybatis-plus-jsqlparser</artifactId>
+</dependency>
+```
+
+> ⚠ **本项目真踩坑**：MP 3.5.5- 时 `PaginationInnerInterceptor` 在 `mybatis-plus-extension` 里；3.5.9+ 拆出来到 `mybatis-plus-jsqlparser`，不加这个依赖就 `ClassNotFoundException`。详见 18.11 ADMIN.5 踩坑实录。
+
+**Step 2：注册插件 Bean**
+
+```java
+// mini-mall-user/src/main/java/com/minimall/user/config/MybatisPlusConfig.java
+@Configuration
+public class MybatisPlusConfig {
+
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+        // 关键: PaginationInnerInterceptor 才是分页拦截器, 必须指定数据库类型
+        interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.MYSQL));
+        return interceptor;
+    }
+}
+```
+
+**没这个 Bean 的后果**（ADMIN.5 实测）：
+- 调 `service.page(p, wrapper)` SQL **不会改写**，没有 LIMIT，全表扫返回
+- `IPage.getTotal()` 永远是 **0**（因为根本没跑 count SQL）
+
+**Step 3：用 `service.page(Page, Wrapper)` 查**
+
+```java
+@GetMapping("/page")
+public Result<IPage<Product>> page(AdminProductPageDTO query) {
+    // 构造分页对象 (当前页, 每页条数)
+    Page<Product> p = new Page<>(query.getPage(), query.getSize());
+
+    // 拼条件 (LambdaQueryWrapper 是 MP 的链式 SQL 构造器)
+    LambdaQueryWrapper<Product> w = new LambdaQueryWrapper<>();
+    w.like(query.getKeyword() != null, Product::getName, query.getKeyword());
+    w.eq(query.getCategoryId() != null, Product::getCategoryId, query.getCategoryId());
+    w.orderByDesc(Product::getId);
+
+    // ⭐ service.page 是 IService 提供的, 内部调 BaseMapper.selectPage
+    IPage<Product> result = productService.page(p, w);
+    return Result.success(result);
+}
+```
+
+#### 18.9.2 关键对象速查
+
+| 对象 | 来源 | 作用 |
+|---|---|---|
+| `Page<T>` | MP 提供的 IPage 实现类 | 既是**入参**（带 current/size）也是**返回值**（自动填 records/total/pages） |
+| `IPage<T>` | 接口 | `Page<T>` 实现它；controller 返回类型用接口更通用 |
+| `LambdaQueryWrapper<T>` | MP 提供 | 用 `User::getName` lambda 替代字符串列名，重构安全 |
+| `PaginationInnerInterceptor` | MP 插件 | 真正干活的：拦截 SQL，改写加 LIMIT + 跑 count |
+
+#### 18.9.3 IPage 返回 JSON 长这样
+
+```json
+{
+  "code": 200,
+  "message": "操作成功",
+  "data": {
+    "records": [ { "id": 14, ... }, { "id": 13, ... } ],
+    "total": 14,
+    "size": 10,
+    "current": 1,
+    "pages": 2
+  }
+}
+```
+
+前端 axios 拦截器解 `data` 后直接 `res.records` / `res.total` 就能用（参见前端 `src/api/user.ts` 的 `PageResult<T>` 类型）。
+
+#### 18.9.4 MP 智能 count（自动优化）
+
+MP 的 `PaginationInnerInterceptor` 跑 count SQL 时**自动**做两件事：
+- 剔除 `ORDER BY`（count 不需要排序）
+- 剔除 `LEFT JOIN`（前提是被 join 的表没在 WHERE 出现，剔了不影响行数）
+
+效果：业务 SQL 写得多复杂，count SQL 都会精简成最小开销，**深分页时显著提速**。
+
+#### 18.9.5 分页 + @TableLogic 配合
+
+实体上加了 `@TableLogic` 的 `is_deleted` 字段，分页 SQL 会自动加 `WHERE is_deleted=0`，count 也会。
+
+```java
+// Orders.java
+@TableLogic
+private Byte isDeleted;
+```
+
+实际执行的 SQL（从 ADMIN.5 调试日志抓的）：
+
+```sql
+-- 分页 (插件改写后)
+SELECT id,order_no,user_id,total_amount,status,... 
+FROM orders 
+WHERE is_deleted=0 
+ORDER BY id DESC 
+LIMIT 0, 10
+
+-- count (插件自动跑, 剔了 ORDER BY)
+SELECT COUNT(*) FROM orders WHERE is_deleted=0
+```
+
+#### 18.9.6 完整端到端 demo（ADMIN.3 用户管理实例） <a id="sec066-9-6"></a>
+
+> 跟着这一节，从 pom 到 curl 把一个 MP 分页接口完整跑起来。**代码全部出自本项目 `mini-mall-user` 实战**，复制即用。
+
+**整体结构：8 层文件**
+
+```
+mini-mall-user/
+├── pom.xml                       ← ① 依赖
+├── src/main/resources/
+│   ├── application.yml           ← ② 配置
+│   └── (建表 SQL)                ← ③ 表结构
+├── src/main/java/com/minimall/user/
+│   ├── entity/User.java          ← ④ 实体
+│   ├── mapper/UserMapper.java    ← ⑤ Mapper (空, 继承 BaseMapper)
+│   ├── config/
+│   │   └── MybatisPlusConfig.java← ⑥ 注册分页插件 Bean
+│   ├── dto/
+│   │   └── AdminUserPageDTO.java ← ⑦ 入参
+│   └── controller/
+│       └── AdminUserController.java ← ⑧ 分页接口
+```
+
+##### ① pom.xml 依赖（关键 4 条）
+
+```xml
+<!-- ⭐ 单纯加 starter 不够, 3.5.9+ 还要单独引 jsqlparser -->
+<dependency>
+    <groupId>com.baomidou</groupId>
+    <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+    <!-- 版本由 mini-mall-cloud 根 pom 锁: 3.5.9 -->
+</dependency>
+<dependency>
+    <groupId>com.baomidou</groupId>
+    <artifactId>mybatis-plus-jsqlparser</artifactId>
+</dependency>
+
+<!-- MySQL 驱动: runtime 即可, 编译期不需要 -->
+<dependency>
+    <groupId>com.mysql</groupId>
+    <artifactId>mysql-connector-j</artifactId>
+    <scope>runtime</scope>
+</dependency>
+
+<!-- Lombok 简化 entity / dto -->
+<dependency>
+    <groupId>org.projectlombok</groupId>
+    <artifactId>lombok</artifactId>
+    <optional>true</optional>
+</dependency>
+```
+
+##### ② application.yml 配置
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:mysql://127.0.0.1:3306/mini_mall?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
+    username: root
+    password: 123456
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true                # 下划线转驼峰 (create_time → createTime)
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl  # 打印 SQL, 调试分页必备
+  global-config:
+    db-config:
+      logic-delete-field: isDeleted   # 全局逻辑删除字段 (字段加 @TableLogic 也可)
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+```
+
+##### ③ 数据库表
+
+```sql
+CREATE TABLE `user` (
+    `id`        BIGINT       PRIMARY KEY AUTO_INCREMENT,
+    `username`  VARCHAR(64)  NOT NULL UNIQUE,
+    `password`  VARCHAR(128),
+    `nickname`  VARCHAR(64),
+    `email`     VARCHAR(128),
+    `role`      TINYINT      NOT NULL DEFAULT 0    COMMENT '0 普通 / 1 管理员',
+    `status`    TINYINT      NOT NULL DEFAULT 1    COMMENT '0 禁用 / 1 正常',
+    `oauth_provider` VARCHAR(32) NULL,
+    `is_deleted`     TINYINT  NOT NULL DEFAULT 0,
+    `create_time`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `update_time`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+##### ④ Entity（MP 三大注解都用上）
+
+```java
+package com.minimall.user.entity;
+
+import com.baomidou.mybatisplus.annotation.*;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import lombok.Data;
+import java.time.LocalDateTime;
+
+@Data
+@TableName("user")   // 显式指定表名 (避免 user 是保留字之类的歧义)
+public class User {
+
+    @TableId(value = "id", type = IdType.AUTO)   // 主键自增
+    private Long id;
+
+    private String username;
+
+    @JsonIgnore                                  // ⭐ 序列化时不返给前端
+    private String password;
+
+    private String nickname;
+    private String email;
+    private Byte   role;        // 0 普通 / 1 管理员
+    private Byte   status;      // 0 禁用 / 1 正常
+    private String oauthProvider;
+
+    @TableLogic                                  // ⭐ 自动 WHERE is_deleted=0
+    private Byte isDeleted;
+
+    private LocalDateTime createTime;
+    private LocalDateTime updateTime;
+}
+```
+
+##### ⑤ Mapper（一行代码搞定 17 个方法）
+
+```java
+package com.minimall.user.mapper;
+
+import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import com.minimall.user.entity.User;
+
+// 不写 @Mapper, 因为启动类 @MapperScan("com.minimall.user.mapper") 已扫
+// 继承 BaseMapper<User> 自动获得 17 个方法: selectById / selectPage / insert / updateById ...
+public interface UserMapper extends BaseMapper<User> {
+}
+```
+
+##### ⑥ 分页插件 Bean（**最关键，漏配就是 ADMIN.5 那个坑**）
+
+```java
+package com.minimall.user.config;
+
+import com.baomidou.mybatisplus.annotation.DbType;
+import com.baomidou.mybatisplus.extension.plugins.MybatisPlusInterceptor;
+import com.baomidou.mybatisplus.extension.plugins.inner.PaginationInnerInterceptor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class MybatisPlusConfig {
+
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+        // ⭐ 没这一行: service.page() SQL 不会被改写, 没 LIMIT, total=0
+        interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.MYSQL));
+        return interceptor;
+    }
+}
+```
+
+##### ⑦ 查询入参 DTO
+
+```java
+package com.minimall.user.dto;
+
+import lombok.Data;
+
+@Data
+public class AdminUserPageDTO {
+    private Integer page = 1;        // 当前页 (默认 1)
+    private Integer size = 20;       // 每页条数 (默认 20)
+    private String  keyword;         // 关键词: 模糊匹配 username 或 nickname
+    private Byte    status;          // null = 不过滤
+    private Byte    role;            // null = 不过滤
+}
+```
+
+##### ⑧ Controller（核心 13 行）
+
+```java
+package com.minimall.user.controller;
+
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.minimall.common.core.domain.Result;
+import com.minimall.user.dto.AdminUserPageDTO;
+import com.minimall.user.entity.User;
+import com.minimall.user.mapper.UserMapper;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/admin/user")
+public class AdminUserController {
+
+    @Autowired
+    private UserMapper userMapper;
+
+    @GetMapping("/page")
+    public Result<IPage<User>> page(AdminUserPageDTO query) {
+        // ① 分页对象
+        Page<User> p = Page.of(query.getPage(), query.getSize());
+
+        // ② 动态条件: 字段非空才加 WHERE
+        QueryWrapper<User> w = new QueryWrapper<>();
+        if (query.getKeyword() != null && !query.getKeyword().isEmpty()) {
+            w.and(q -> q.like("username", query.getKeyword())
+                        .or().like("nickname", query.getKeyword()));
+        }
+        if (query.getStatus() != null) w.eq("status", query.getStatus());
+        if (query.getRole()   != null) w.eq("role",   query.getRole());
+        w.orderByDesc("id");                       // 新用户在前
+
+        // ③ 一行触发分页 (插件拦截, 自动 LIMIT + COUNT)
+        IPage<User> result = userMapper.selectPage(p, w);
+
+        // ④ 兜底清密码 (因为 entity 没加 @JsonIgnore 就是这种兜底, 加了可以省)
+        result.getRecords().forEach(u -> u.setPassword(null));
+
+        return Result.success(result);
+    }
+}
+```
+
+##### 运行 + 测试
+
+```bash
+# 1. 启动 user 服务 (端口 9001)
+java -jar mini-mall-user-0.0.1-SNAPSHOT.jar
+
+# 2. 拿 admin token (略, 走 /auth/login)
+
+# 3. 分页查询
+curl "http://localhost:9001/admin/user/page?page=1&size=3&role=1" \
+     -H "Authorization: Bearer $TOKEN"
+```
+
+##### 控制台实际看到的 SQL（验证插件生效）
+
+```sql
+==>  Preparing: 
+  SELECT COUNT(*) FROM user WHERE is_deleted=0 AND role = ?
+==>  Parameters: 1(Byte)
+<==      Total: 1                              ← ✅ count SQL 跑了, 返 1
+
+==>  Preparing: 
+  SELECT id, username, password, nickname, email, role, status, oauth_provider, 
+         is_deleted, create_time, update_time 
+  FROM user 
+  WHERE is_deleted=0 AND role = ? 
+  ORDER BY id DESC 
+  LIMIT ?
+==>  Parameters: 1(Byte), 3(Long)              ← ✅ 自动 LIMIT 3
+<==      Total: 1
+```
+
+> 重点关注三件事：① count SQL 自动剔了 `ORDER BY id DESC`；② 主查询自动加 `LIMIT ?`；③ `WHERE is_deleted=0` 是 `@TableLogic` 自动加的。
+
+##### 返回的 JSON
+
+```json
+{
+  "code": 200,
+  "message": "操作成功",
+  "data": {
+    "records": [
+      { "id": 7, "username": "admin", "nickname": "超级管理员", "role": 1, "status": 1, "password": null }
+    ],
+    "total": 1,
+    "size": 3,
+    "current": 1,
+    "pages": 1
+  }
+}
+```
+
+##### Checklist：跑不通时按顺序排查
+
+| 现象 | 检查 |
+|---|---|
+| 404 | `@MapperScan` 扫到包路径了？controller 注解都对？ |
+| 500 ClassNotFound: PaginationInnerInterceptor | **pom 漏 `mybatis-plus-jsqlparser`** |
+| 200 但 total=0 + 全表扫 | 漏建 `MybatisPlusConfig` 注册 Bean（ADMIN.5 经典坑） |
+| 200 但 records 字段全是下划线 | 漏配 `map-underscore-to-camel-case: true` |
+| 200 但 records 带 password 密文 | 漏 `setPassword(null)` 兜底或漏 `@JsonIgnore` |
+| 删了一条还能查到 | 漏 `@TableLogic` 注解 / yml 全局配置 |
+
+### 18.10 原生方案 vs PageHelper 对照 demo <a id="sec066-10"></a>
+
+> 本节只为对照学习，本项目不用。如果你将来在**纯 MyBatis 项目**（没 MP）里要做分页，参考这套。
+
+#### 18.10.1 原生手写 LIMIT（最朴素）
+
+**Mapper 接口（多参数必须 `@Param`，否则 XML 只能用 `#{arg0}` 难读）**
+
+```java
+public interface UserMapper {
+    // 数据 SQL: 手动 LIMIT
+    List<User> selectByLimit(@Param("offset") Integer offset,
+                             @Param("pageSize") Integer pageSize);
+    // count SQL: 单独一条
+    Long selectCount();
+}
+```
+
+**XML**
+
+```xml
+<select id="selectByLimit" resultType="User">
+    SELECT id, username, age, email, create_time
+    FROM user
+    LIMIT #{offset}, #{pageSize}
+</select>
+
+<select id="selectCount" resultType="Long">
+    SELECT COUNT(*) FROM user
+</select>
+```
+
+**Service 手动组装（每个分页接口都要写这套）**
+
+```java
+public PageResult<User> page(Integer pageNum, Integer pageSize) {
+    int offset = (pageNum - 1) * pageSize;            // 偏移量
+    List<User> records = userMapper.selectByLimit(offset, pageSize);
+    Long total = userMapper.selectCount();
+    long pages = (total + pageSize - 1) / pageSize;   // 向上取整 (替代 % 三目)
+
+    return new PageResult<>(records, total, pageNum, pageSize, pages);
+}
+```
+
+**缺点**：每多一个表的分页接口，重复写一遍这套；多条件查询要在 LIMIT SQL 和 count SQL 里各写一份 WHERE，容易漏改。
+
+#### 18.10.2 PageHelper 插件
+
+**pom**
+
+```xml
+<dependency>
+    <groupId>com.github.pagehelper</groupId>
+    <artifactId>pagehelper-spring-boot-starter</artifactId>
+    <version>1.4.7</version>
+</dependency>
+```
+
+**application.yml**
+
+```yaml
+pagehelper:
+  helper-dialect: mysql
+  reasonable: true            # 页码 <1 自动查第 1 页, 越界自动查最后一页
+  support-methods-arguments: true
+```
+
+**Mapper 接口（普通查询，无 LIMIT）**
+
+```java
+@Select("SELECT id, username, age, email FROM user")
+List<User> selectAll();
+```
+
+**Service：一行 startPage**
+
+```java
+public PageResult<User> page(Integer pageNum, Integer pageSize) {
+    // ⭐ 紧跟下一条 SQL 自动加分页, 自动跑 count
+    PageHelper.startPage(pageNum, pageSize);
+    List<User> list = userMapper.selectAll();          // 返回的其实是 Page<User>
+
+    Page<User> pageInfo = (Page<User>) list;
+    return new PageResult<>(
+            pageInfo.getResult(),
+            pageInfo.getTotal(),
+            pageInfo.getPageNum(),
+            pageInfo.getPageSize(),
+            (long) pageInfo.getPages()
+    );
+}
+```
+
+**避坑（PageHelper 高频面试题）**：
+
+1. `startPage()` 后**必须紧跟一条** select，中间不能夹其他查询。否则分页绑到了别的 SQL，目标 SQL 退化成全表扫。
+2. 分页参数存在 **ThreadLocal**，所以分页只对**当前线程的下一条 select** 生效，自动用完即清。
+3. 关闭 count：`PageHelper.startPage(pageNum, pageSize, false)` —— 不要总数时省一次 SQL。
+4. 不要在循环里调 `startPage()`，会堆积参数。
+
+#### 18.10.3 三方案统一返回类 PageResult<T>
+
+PageResult **不是框架自带**的，是项目自定义的统一前后端约定。三种方案最后都把数据塞进它返前端。
+
+```java
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class PageResult<T> {
+    private List<T> records;
+    private Long    total;
+    private Integer pageNum;
+    private Integer pageSize;
+    private Long    pages;
+}
+```
+
+> 本项目用的是 MP 自带的 `IPage<T>`（字段是 `records / total / size / current / pages`），不另定义 `PageResult`。前端 `PageResult<T>` 是 **TypeScript 接口**而非 Java 类，只是为了前端类型对齐 MP 的 IPage。
+
+#### 18.10.4 三种方案选型决策表
+
+| 你的项目 | 推荐 |
+|---|---|
+| **已经用 MyBatis-Plus** | ③ MP `PaginationInnerInterceptor`（**本项目**） |
+| 纯 MyBatis、不想引插件 | ① 原生 LIMIT |
+| 纯 MyBatis、想偷懒 | ② PageHelper |
+| 纯 MyBatis + 多数据库（MySQL/Oracle 切换） | ② PageHelper（`helperDialect` 自动切换） |
+| 单条 SQL 千万级深分页 | 任何方案都要换"游标分页"，见 18.12 |
+
+### 18.11 ADMIN.5 真踩坑：order 服务漏配 PaginationInnerInterceptor <a id="sec066-11"></a>
+
+#### 现象
+
+ADMIN.5 后台订单分页接口刚跑通，curl 测：
+
+```bash
+curl /admin/order/page?page=1&size=3
+```
+
+返回：
+
+```json
+{
+  "total": 0,        ← ❌ 实际表里有 14 条
+  "records": [       ← ✅ 返了 8 条 (不是 3 条!)
+    { "id": 14 }, ... { "id": 7 }
+  ]
+}
+```
+
+#### 根因诊断
+
+打开 MyBatis 的 SQL 日志（`log-impl: org.apache.ibatis.logging.stdout.StdOutImpl`）看实际 SQL：
+
+```sql
+SELECT id, order_no, ... FROM orders WHERE is_deleted=0 ORDER BY id DESC
+```
+
+**没有 LIMIT**！这说明 `PaginationInnerInterceptor` 完全没拦截 SQL —— 插件 Bean 根本没注册。
+
+#### 根因
+
+```bash
+$ find mini-mall-cloud/mini-mall-order -name "MybatisPlusConfig.java"
+# 空，没有！
+
+$ grep -A1 "mybatis-plus" mini-mall-cloud/mini-mall-order/pom.xml
+mybatis-plus-spring-boot3-starter  ← 只有这一个，缺 jsqlparser
+```
+
+历史原因：order 服务以前的端点（`/order/my`）直接 `List<>` 返全部用户订单，不需要分页，所以一直没人配过分页插件。今天加了 admin 后台分页才暴露。
+
+#### 修复（两步）
+
+**Step 1：order pom 加 jsqlparser**
+
+```xml
+<dependency>
+    <groupId>com.baomidou</groupId>
+    <artifactId>mybatis-plus-jsqlparser</artifactId>
+</dependency>
+```
+
+**Step 2：新建 MybatisPlusConfig 注册 Bean**（跟 user / product 服务那个一模一样）
+
+```java
+@Configuration
+public class MybatisPlusConfig {
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+        interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.MYSQL));
+        return interceptor;
+    }
+}
+```
+
+重打包 + 重启 order 服务，SQL 立刻有 LIMIT，total 正常返 14。
+
+#### 教训
+
+每个新建的微服务，**只要将来可能用到分页**，就把这个 Config 类一起复制过去，别留隐患。这是 ADMIN.5 之后产品的踩坑记忆。
+
+### 18.12 深分页性能 + 优化方案 <a id="sec066-12"></a>
+
+#### 问题
+
+`LIMIT 100000, 10` 实际怎么执行？MySQL 会扫描前 **100010 条**记录、丢掉前 100000、返最后 10 条 —— 越往后越慢。
+
+```sql
+-- 实测 100w 数据
+SELECT * FROM orders LIMIT 0, 10        -- ~1ms
+SELECT * FROM orders LIMIT 100000, 10   -- ~500ms
+SELECT * FROM orders LIMIT 500000, 10   -- ~3000ms
+```
+
+#### 优化方案 1：游标/主键分页（推荐）
+
+不再用 page 跳转，改用"上一页最后一条的 id"作为锚点：
+
+```sql
+-- 客户端记住上一页最后 id (比如 100000)
+SELECT * FROM orders 
+WHERE is_deleted=0 AND id < 100000 
+ORDER BY id DESC 
+LIMIT 10
+```
+
+主键索引直接跳到 100000，零扫描，性能恒定。代价：**不支持跳页**，只能"下一页"。适合无限滚动、消息流类。
+
+#### 优化方案 2：延迟关联（兼容跳页）
+
+只对小 id 列分页，再 join 回主表：
+
+```sql
+SELECT o.*
+FROM orders o
+JOIN (
+    SELECT id FROM orders WHERE is_deleted=0 ORDER BY id DESC LIMIT 100000, 10
+) tmp ON o.id = tmp.id
+```
+
+子查询只走 id 索引（覆盖索引），不回表，比直接 `SELECT * LIMIT 100000,10` 快几个数量级。
+
+#### 本项目层面
+
+mini-mall-cloud 当前数据量（订单 14 条）远没到深分页瓶颈，**不用优化**。但订单表如果未来上千万，admin 后台分页"跳到第 1000 页"就会卡，那时候要么改游标，要么前端禁掉跳页改成"上一页/下一页"。
+
+### 18.13 #{} vs ${} 与 @Param 速查（分页高频考点） <a id="sec066-13"></a>
+
+#### #{} 必用，${} 严禁用于 LIMIT
+
+| 写法 | 行为 | 用法 |
+|---|---|---|
+| `#{offset}` | **预编译占位符** `?`，参数后传 | 99% 的场景，包括 LIMIT 参数 |
+| `${offset}` | **字符串拼接**到 SQL | 仅用于动态表名/列名/排序方向 |
+
+```xml
+<!-- ✅ 正确, 预编译, 防注入 -->
+LIMIT #{offset}, #{pageSize}
+
+<!-- ❌ 危险, 如果 offset 是用户传的, 可以 SQL 注入 -->
+LIMIT ${offset}, ${pageSize}
+```
+
+#### @Param 何时必加
+
+| 场景 | 加不加 |
+|---|---|
+| **方法多个参数**（含分页 offset/size） | **必须加** `@Param("offset")`，否则 XML 只能 `#{arg0}` `#{param1}` 难读 |
+| 方法只有 1 个基本类型参数 | 可不加（XML 直接 `#{id}` 也认） |
+| 方法传 1 个 POJO/Map | 不用加（XML 直接 `#{username}` 取对象属性） |
+
+```java
+// ✅ 多参数, 加 @Param
+List<User> selectByLimit(@Param("offset") Integer offset,
+                         @Param("pageSize") Integer pageSize);
+
+// ✅ 单 POJO, 不加 @Param
+List<User> selectByCondition(User condition);  // XML 里 #{username} 取 condition.username
+```
+
+### 18.14 第十八章分页知识地图（一页脑图） <a id="sec066-14"></a>
+
+```
+MyBatis 分页
+├── 方案选择
+│   ├── ① 原生 LIMIT          → XML 手写 limit+count, Service 拼 PageResult
+│   ├── ② PageHelper          → startPage(p,s) + 普通 SELECT, 拦截器自动处理
+│   └── ③ MP PaginationIner   → service.page(Page, Wrapper)  ★ 本项目
+│
+├── MP 三步配齐
+│   ├── pom: mybatis-plus-jsqlparser (3.5.9+ 必加)
+│   ├── @Bean MybatisPlusInterceptor + PaginationInnerInterceptor
+│   └── new Page<>(current, size) → service.page(p, wrapper)
+│
+├── 关键对象
+│   ├── Page<T>          入参 + 返回值, 自动填 records/total/pages
+│   ├── IPage<T>         接口, controller 返这个更通用
+│   └── LambdaQueryWrapper<T>   类型安全的条件构造器
+│
+├── SQL 底层
+│   ├── 分页 SQL:  原 SQL + LIMIT 自动拼上
+│   ├── count SQL: MP 自动剔 ORDER BY / LEFT JOIN 提速
+│   └── @TableLogic 字段自动 WHERE is_deleted=0
+│
+├── 踩坑
+│   ├── ADMIN.5: 漏配 PaginationInnerInterceptor → total=0
+│   ├── PageHelper 中间穿插 SQL → 分页失效
+│   └── 同时引 PageHelper + MP 插件 → 互相打架
+│
+└── 性能
+    ├── 小数据: 任意方案
+    ├── 大数据 deep page: 游标分页 / 延迟关联
+    └── 不需要 total: PageHelper false 参数 / MP 用 selectList 代替
+```
+
+---
 
 ## 十九、登录注册与 JWT 鉴权 <a id="sec067"></a>
 

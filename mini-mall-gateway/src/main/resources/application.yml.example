@@ -29,6 +29,22 @@ spring:
           predicates:
             - Path=/auth/**
 
+        # ─── ADMIN 阶段新增: 后台管理 ─────────────
+        # /admin/** 不是单一服务, 按子路径分发到对应业务服务
+        # 网关 AuthGlobalFilter 已经统一校验过 role=1
+        - id: admin-user-route
+          uri: lb://mini-mall-user
+          predicates:
+            - Path=/admin/user/**
+        - id: admin-product-route
+          uri: lb://mini-mall-product
+          predicates:
+            - Path=/admin/product/**
+        - id: admin-order-route
+          uri: lb://mini-mall-order
+          predicates:
+            - Path=/admin/order/**
+
         # ─── user 服务 ─────────────────────────
         - id: user-route
           uri: lb://mini-mall-user

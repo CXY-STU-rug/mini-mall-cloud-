@@ -35,6 +35,12 @@ public interface IOrdersService extends IService<Orders> {
     /** 订单详情 */
     OrderDetailVO getOrderDetail(Long userId, Long orderId);
 
+    /**
+     * 订单详情 (ADMIN 用): 跳过越权校验, 因为管理员可以看任何订单
+     * 仅供 /admin/order/{id} 端点使用; 网关已校验 role=1
+     */
+    OrderDetailVO getOrderDetailForAdmin(Long orderId);
+
     /** 用户手动取消订单 */
     void cancelOrder(Long userId, Long orderId);
 

@@ -407,6 +407,42 @@ public class OrdersServiceImpl extends ServiceImpl<OrdersMapper, Orders> impleme
     }
 
     // ════════════════════════════════════════════════════════════
+    // ③.5 ADMIN 用: 同上, 跳过 userId 越权校验
+    // ════════════════════════════════════════════════════════════
+    @Override
+    public OrderDetailVO getOrderDetailForAdmin(Long orderId) {
+        Orders order = ordersMapper.selectById(orderId);
+        if (order == null) {
+            throw new BusinessException(404, "订单不存在");
+        }
+        // ⚠ 跟 getOrderDetail 的区别: 没有 userId 越权校验
+        // 管理员可以看任何用户的订单, 网关 AuthGlobalFilter 已挡了 role!=1
+
+        List<OrderItem> items = orderItemMapper.selectList(
+                new LambdaQueryWrapper<OrderItem>().eq(OrderItem::getOrderId, orderId)
+        );
+        List<OrderItemVO> itemVOs = new ArrayList<>();
+        for (OrderItem item : items) {
+            OrderItemVO ivo = new OrderItemVO();
+            ivo.setOrderItemId(item.getId());
+            ivo.setProductId(item.getProductId());
+            ivo.setProductName(item.getProductName());
+            ivo.setProductImage(item.getProductImage());
+            ivo.setPrice(item.getPrice());
+            ivo.setQuantity(item.getQuantity());
+            ivo.setSubtotal(item.getSubtotal());
+            itemVOs.add(ivo);
+        }
+
+        OrderDetailVO vo = new OrderDetailVO();
+        BeanUtils.copyProperties(order, vo);
+        vo.setOrderId(order.getId());
+        vo.setStatusDesc(statusDesc(order.getStatus()));
+        vo.setItems(itemVOs);
+        return vo;
+    }
+
+    // ════════════════════════════════════════════════════════════
     // ④ 用户手动取消订单
     // ════════════════════════════════════════════════════════════
     @Override

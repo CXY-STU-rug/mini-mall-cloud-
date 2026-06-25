@@ -80,8 +80,8 @@ public class AuthController {
             throw new BusinessException("用户名或密码错误");
         }
 
-        // ③ 签 mini-mall 自家 JWT
-        String token = jwtUtil.generateToken(user.getId(), user.getUsername());
+        // ③ 签 mini-mall 自家 JWT (ADMIN 阶段: role 一起塞)
+        String token = jwtUtil.generateToken(user.getId(), user.getUsername(), user.getRole());
 
         // ④ 兜底清掉密文, 防止返前端
         user.setPassword(null);
@@ -142,8 +142,8 @@ public class AuthController {
         }
         User savedUser = createResp.getData();   // 含 user 服务回填的 id
 
-        // ④ 签 token, 注册即登录
-        String token = jwtUtil.generateToken(savedUser.getId(), savedUser.getUsername());
+        // ④ 签 token, 注册即登录 (新注册用户 role=0)
+        String token = jwtUtil.generateToken(savedUser.getId(), savedUser.getUsername(), savedUser.getRole());
         savedUser.setPassword(null);             // 兜底
         return Result.success(new AuthResponse(token, savedUser));
     }

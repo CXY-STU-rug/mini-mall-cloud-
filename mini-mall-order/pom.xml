@@ -68,6 +68,12 @@
             <groupId>com.baomidou</groupId>
             <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
         </dependency>
+        <!-- ADMIN.5 加: MP 3.5.9+ 把 PaginationInnerInterceptor 拆到了 jsqlparser 包,
+             不加它分页插件 Bean 注册不上, SQL 不会被改写加 LIMIT -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-jsqlparser</artifactId>
+        </dependency>
 
         <!-- ⭐ G2 新增: RabbitMQ 客户端 (spring-rabbit)
              这一行 starter 帮我们做的事:

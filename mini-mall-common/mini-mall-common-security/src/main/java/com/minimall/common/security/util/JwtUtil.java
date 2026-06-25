@@ -54,19 +54,26 @@ public class JwtUtil {
      * 其他保持原样
      */
     public String generateToken(Long userId, String username) {
-        // 1. 业务数据塞 claims (token 的 payload 段)
+        // 兼容老调用 (没 role): 默认 role=0 (普通用户)
+        return generateToken(userId, username, (byte) 0);
+    }
+
+    /**
+     * ADMIN 阶段新增重载: 把 role 也塞 JWT
+     * 网关 AuthGlobalFilter 解 token 后可以直接读 role 判断是否管理员, 不用每次查 DB.
+     */
+    public String generateToken(Long userId, String username, Byte role) {
         Map<String, Object> claims = new HashMap<>();
         claims.put("userId", userId);
         claims.put("username", username);
+        claims.put("role", role);
 
-        // 2. Jwts.builder() 链式生成: claims + 时间戳 + 签名 → xxx.yyy.zzz
-        //    注意: 0.12.x 用 .claims() / .issuedAt() / .expiration() (无 set 前缀)
         return Jwts.builder()
-                .claims(claims)                                                          // payload 业务数据
-                .issuedAt(new Date())                                                    // iat 签发时间
-                .expiration(new Date(System.currentTimeMillis() + jwtProperties.getExpiration())) // exp 过期时间
-                .signWith(getSigningKey())                                               // 用密钥签名
-                .compact();                                                              // 输出最终字符串
+                .claims(claims)
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + jwtProperties.getExpiration()))
+                .signWith(getSigningKey())
+                .compact();
     }
 
     /**
@@ -91,6 +98,12 @@ public class JwtUtil {
     /** 从 token 提取 username */
     public String getUsernameFromToken(String token) {
         return parseToken(token).get("username", String.class);
+    }
+
+    /** 从 token 提取 role; 老 token 没塞 role 时返回 null, 调用方按非管理员处理 */
+    public Byte getRoleFromToken(String token) {
+        Integer role = parseToken(token).get("role", Integer.class);   // JWT 反序列化 Byte 会变 Integer
+        return role == null ? null : role.byteValue();
     }
 
     /**
