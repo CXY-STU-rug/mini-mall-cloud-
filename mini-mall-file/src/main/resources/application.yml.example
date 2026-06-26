@@ -1,0 +1,50 @@
+# ═══════════════════════════════════════════════════════════
+# mini-mall-file 对象存储服务配置 (示例 / 模板)
+# 用法: cp application.yml.example application.yml , 然后填自己的 MinIO 凭证
+# ═══════════════════════════════════════════════════════════
+
+server:
+  # 端口规划: gateway 9080 / user 9001 / product 9002 / order 9003
+  #         review 9004 / search 9005 / auth 9006 / file 9007 (新)
+  port: 9007
+
+spring:
+  application:
+    name: mini-mall-file
+
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+    sentinel:
+      transport:
+        dashboard: 127.0.0.1:8858
+        port: 8722   # 跟 user(8719)/product(8720)/order(8721) 错开
+      eager: true
+
+  # ⭐ Spring 默认 multipart 上限 1MB / 10MB, 改大点支持商品图
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
+
+# ═══════════════════════════════════════════════════════════
+# ⭐ MinIO 配置 (改这里)
+# 上线必改: 1) endpoint 换公网地址 / 域名
+#          2) 强密码 (root 账号建议只用来管理, 业务用专门的 access-key)
+#          3) bucket 名不变 mini-mall (已建好 + 设公共读)
+# ═══════════════════════════════════════════════════════════
+minio:
+  endpoint: http://127.0.0.1:9010      # MinIO API 端口 (容器 9000 映射到宿主机 9010)
+  access-key: minioadmin               # ⭐ 你填
+  secret-key: minioadmin123            # ⭐ 你填
+  bucket: mini-mall                    # 已建好, 公共读
+  # 用户拿到的访问 URL 前缀 (生产应该改成域名 https://cdn.your-domain.com)
+  public-url: http://127.0.0.1:9010/mini-mall
+
+logging:
+  level:
+    com.minimall: debug
+    io.minio: info
+    root: info

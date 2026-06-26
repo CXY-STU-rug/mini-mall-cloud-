@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         parent: 继承根 pom 拿:
+            ① Spring Boot 3.3.5
+            ② SC / SCA / minio 8.5.11 dependencyManagement
+            ③ Nacos discovery + config + Sentinel (父 pom 强制依赖)
+         ═══════════════════════════════════════════════════════════ -->
+    <parent>
+        <groupId>com.minimall</groupId>
+        <artifactId>mini-mall-cloud</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>mini-mall-file</artifactId>
+    <name>mini-mall-file</name>
+    <description>对象存储服务：图片/视频/文档上传, 走 MinIO (S3 协议)</description>
+
+    <dependencies>
+
+        <!-- ① common-core (Result / BusinessException) -->
+        <dependency>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-core</artifactId>
+        </dependency>
+
+        <!-- ② common-security (HeaderInterceptor 从 X-User-Id 取用户, 上传要登录) -->
+        <dependency>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-security</artifactId>
+        </dependency>
+
+        <!-- ③ Swagger -->
+        <dependency>
+            <groupId>com.minimall</groupId>
+            <artifactId>mini-mall-common-swagger</artifactId>
+        </dependency>
+
+        <!-- ④ Spring Web -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- ⑤ ⭐ MinIO Java SDK (核心)
+             根 pom dependencyManagement 锁了 8.5.11 -->
+        <dependency>
+            <groupId>io.minio</groupId>
+            <artifactId>minio</artifactId>
+        </dependency>
+
+        <!-- ⑥ Sentinel 规则持久化到 Nacos (跟其它业务服务保持一致) -->
+        <dependency>
+            <groupId>com.alibaba.csp</groupId>
+            <artifactId>sentinel-datasource-nacos</artifactId>
+        </dependency>
+
+        <!-- ⑦ Lombok (common-core 用 optional 不传递, 这里要自己声明) -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- ⚠️ 没有 MyBatis-Plus / MySQL: file 服务不连 DB
+                没有 Feign: 暂时不调其它服务 (将来要记上传日志可加) -->
+
+    </dependencies>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         ⭐ 显式声明 spring-boot-maven-plugin 才能打 fat jar
+         ═══════════════════════════════════════════════════════════ -->
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

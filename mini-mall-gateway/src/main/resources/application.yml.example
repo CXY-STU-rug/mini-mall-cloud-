@@ -87,6 +87,13 @@ spring:
           predicates:
             - Path=/seckill/**
 
+        # ─── FILE 阶段新增: 对象存储 → file ─────
+        # /file/upload 上传图片到 MinIO; 不在白名单 → 自动需 JWT
+        - id: file-route
+          uri: lb://mini-mall-file
+          predicates:
+            - Path=/file/**
+
 logging:
   level:
     org.springframework.cloud.gateway: debug

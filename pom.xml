@@ -39,6 +39,8 @@
         <module>mini-mall-search</module>
         <!-- ⭐ AUTH 阶段：抽 login/register/OAuth 出来 → 独立认证服务 -->
         <module>mini-mall-auth</module>
+        <!-- ⭐ FILE 阶段：对象存储服务 (MinIO 上传商品图/头像/凭证) -->
+        <module>mini-mall-file</module>
 
     </modules>
 
