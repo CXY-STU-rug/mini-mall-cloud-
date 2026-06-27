@@ -1,4 +1,4 @@
-# mini-mall-cloud 微服务完整学习笔记（合并版）
+V# mini-mall-cloud 微服务完整学习笔记（合并版）
 
 > 本文件由两份笔记合并而成：
 > - **第 1～31 章 + 附录 A1/A2/A3**：来自《微服务基础知识点_v8.docx》——打地基 + A/B/C/D 阶段 + 底层原理补习。
@@ -5877,6 +5877,861 @@ user-service (Tomcat :9001)
   Windows 上跑 Java 优先用 PowerShell 或 cmd, 不要图省事用 Git Bash。
   Git Bash 适合 git/grep/sed, 不适合启 Java/Node 应用。
 ```
+# Spring Cloud Gateway 底层完整链路：HTTP 请求从网卡进入网关全过程
+Gateway 底层基于 **Spring WebFlux + Reactor-Netty**，完全响应式，和 SpringMVC（Tomcat 同步阻塞）完全两套体系。
+整体链路分层：
+`网卡TCP连接 → ReactorNetty 服务端 → HttpServer 解码HTTP报文 → WebFlux HttpHandler → Gateway 全局过滤器链 → 路由匹配 → 转发到下游服务`
+
+#、核心底层组件总览
+1. **Reactor Netty**：底层网络IO，替代Tomcat，异步非阻塞TCP服务
+2. `HttpServer`：Netty封装，监听端口8080，接收TCP数据流
+3. `ReactorHttpHandlerAdapter`：把Netty请求转成WebFlux标准 `ServerHttpRequest`
+4. `HttpWebHandlerAdapter`：WebFlux顶层入口，持有 `WebHandler`
+5. `DispatcherHandler`：WebFlux核心调度器，分发请求
+6. `RoutePredicateHandlerMapping`：Gateway专属，匹配路由
+7. `FilteringWebHandler`：封装网关全局过滤器 + 路由局部过滤器链
+8. `GatewayFilterChain`：你写的 `GlobalFilter` 就在这里执行
+
+---
+#### 21.13.6
+、完整流程分步拆解（HTTP进来全链路源码走向）
+. 启动阶段：Netty服务初始化，监听端口
+Gateway 启动类 `@SpringBootApplication` 加载自动配置：
+`GatewayAutoConfiguration` → 自动创建 `NettyReactiveWebServerFactory`
+```java
+// 自动配置创建Netty HTTP服务
+public NettyReactiveWebServerFactory reactiveWebServerFactory() {
+    NettyReactiveWebServerFactory factory = new NettyReactiveWebServerFactory();
+    // 绑定配置文件server.port
+    factory.setPort(this.serverProperties.getPort());
+    return factory;
+}
+```
+启动时会创建 Reactor Netty 的 `HttpServer`，绑定 0.0.0.0:8080，开启TCP异步监听。
+
+. 浏览器发起HTTP请求：TCP数据流到达网卡
+1. 客户端建立TCP连接，发送原始HTTP二进制报文（请求行、Header、Body）
+2. Reactor-Netty 的 `Channel` 异步接收ByteBuf字节流，**无阻塞IO**
+3. Netty内置HTTP解码器 `HttpServerCodec` 把二进制字节解析成标准HTTP对象：
+   - 请求行：`GET /product/list HTTP/1.1`
+   - 请求头：`Authorization: Bearer xxx`、`Host`、`Content-Type`
+   - 请求体（POST参数）
+
+> 关键点：这里还是Netty原生对象，不是Spring的ServerHttpRequest
+
+ReactorHttpHandlerAdapter：Netty对象 → WebFlux标准请求
+适配器转换层，桥接Netty和Spring WebFlux：
+```java
+public Mono<Void> apply(HttpServerRequest nettyRequest, HttpServerResponse nettyResponse) {
+    // 1. Netty原生请求 → 封装成Spring WebFlux ServerHttpRequest
+    ServerHttpRequest springReq = new ReactorServerHttpRequest(nettyRequest, this.bufferFactory);
+    ServerHttpResponse springResp = new ReactorServerHttpResponse(nettyResponse, this.bufferFactory);
+    // 2. 交给顶层WebHandler处理
+    return this.httpHandler.handle(springReq, springResp);
+}
+```
+转换后你在过滤器 `exchange.getRequest()` 拿到的就是 `ServerHttpRequest`。
+
+. HttpWebHandlerAdapter：统一入口，包装ServerWebExchange
+WebFlux顶层适配器，把 `ServerHttpRequest + ServerHttpResponse` 封装成**上下文对象 ServerWebExchange**
+```java
+@Override
+public Mono<Void> handle(ServerHttpRequest request, ServerHttpResponse response) {
+    // 封装交换上下文，贯穿整个网关所有过滤器
+    ServerWebExchange exchange = createExchange(request, response);
+    // 进入核心调度器 DispatcherHandler
+    return getDispatcherHandler().handle(exchange);
+}
+```
+你代码里的 `ServerWebExchange` 就是在这里创建，全程传递。
+. DispatcherHandler：WebFlux分发核心（类似SpringMVC DispatcherServlet）
+三大职责：
+1. 遍历所有 `HandlerMapping` 找当前请求对应的处理器
+2. 找到后获取 `HandlerAdapter` 执行处理器
+3. 处理返回结果写入响应
+
+Gateway 提供专属 `RoutePredicateHandlerMapping`，优先级最高，优先匹配网关路由。
+```java
+@Override
+public Mono<Void> handle(ServerWebExchange exchange) {
+    // 1. 查找匹配当前请求的路由处理器
+    return this.handlerMappings.flatMap(mapping -> mapping.getHandler(exchange))
+            .next()
+            .flatMap(handler -> {
+                // 2. 获取适配器执行路由逻辑
+                return this.handlerAdapters.flatMap(adapter -> adapter.supports(handler)
+                        ? adapter.handle(exchange, handler) : Mono.empty()).next();
+            });
+}
+```
+
+. RoutePredicateHandlerMapping：匹配yml里配置的路由
+读取 `application.yml` 中 `spring.cloud.gateway.routes` 所有路由规则：
+- predicates Path=/user/**
+- uri lb://mini-mall-user
+
+遍历所有Route，用断言匹配当前请求path，匹配成功返回 `Route` 对象，包装成 `GatewayWebHandler`。
+
+. FilteringWebHandler：组装过滤器链（你写的AuthGlobalFilter在这里执行）
+ 过滤器分两类
+1. **GlobalFilter 全局过滤器**：你写的 `AuthGlobalFilter implements GlobalFilter, Ordered`，所有请求都会执行
+2. **GatewayFilter 路由局部过滤器**：仅当前路由生效，如限流、重写路径
+
+ 源码核心逻辑
+```java
+public Mono<Void> handle(ServerWebExchange exchange) {
+    // 1. 获取当前路由所有过滤器：全局 + 路由局部
+    List<GatewayFilter> allFilters = getFilters(exchange);
+    // 2. 按Ordered排序：getOrder() 值越小越先执行
+    allFilters.sort(AnnotationAwareOrderComparator.INSTANCE);
+    // 3. 构建过滤器链 GatewayFilterChain
+    GatewayFilterChain chain = new DefaultGatewayFilterChain(allFilters);
+    // 4. 执行第一个过滤器，就是你的AuthGlobalFilter
+    return chain.filter(exchange);
+}
+```
+你代码里 `return chain.filter(exchange)` 就是**责任链模式**，放行到下一个过滤器。
+
+ DefaultGatewayFilterChain 责任链源码极简
+```java
+class DefaultGatewayFilterChain implements GatewayFilterChain {
+    private final int index;
+    private final List<GatewayFilter> filters;
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange) {
+        if (this.index < this.filters.size()) {
+            GatewayFilter filter = this.filters.get(this.index);
+            // 执行当前过滤器，传入下一级链（index+1）
+            return filter.filter(exchange, new DefaultGatewayFilterChain(this.index + 1, this.filters));
+        } else {
+            // 所有过滤器执行完毕，开始转发请求到下游服务
+            return this.route.getHandler().handle(exchange);
+        }
+    }
+}
+```
+- 鉴权通过：走完所有filter，进入转发逻辑
+- 鉴权失败：直接返回 `exchange.getResponse().setComplete()`，终止链路，不再走转发
+
+ 过滤器全部执行完：转发请求到下游微服务
+路由URI是 `lb://mini-mall-user`，负载均衡处理器 `LoadBalancerWebHandler`：
+1. 通过Nacos注册中心拉取服务实例列表
+2. 使用负载均衡算法（轮询/随机）选一台服务节点
+3. 创建新的HTTP客户端 `ReactorHttpClient`，发起跨服务HTTP调用
+4. 下游服务返回响应，原路逐层返回过滤器，最终写回Netty响应
+
+ 响应回流流程（反向）
+下游服务返回数据 → LoadBalancer → 倒序走完过滤器链 → HttpWebHandlerAdapter → ReactorNetty → TCP缓冲区 → 返回浏览器
+
+---
+
+```
+浏览器TCP请求
+↓
+Reactor Netty HttpServer（底层网络）
+↓ ReactorHttpHandlerAdapter 转换
+HttpWebHandlerAdapter → 创建 ServerWebExchange
+↓
+DispatcherHandler（WebFlux调度中心）
+↓
+RoutePredicateHandlerMapping（路由匹配）
+↓
+FilteringWebHandler（组装过滤器）
+↓ DefaultGatewayFilterChain 责任链
+    └── 你的 AuthGlobalFilter（全局鉴权）
+↓
+LoadBalancerWebHandler（负载均衡转发下游）
+↓
+ReactorHttpClient 请求下游服务
+↓ 响应原路返回
+Netty写回TCP，浏览器接收结果
+```
+
+1. **Tomcat + Servlet（同步阻塞）**
+   一个请求占一个线程，线程池固定，高并发阻塞；用 `HttpServletRequest`
+2. **Reactor-Netty + WebFlux（异步非阻塞）**
+   少量线程处理大量连接，基于事件驱动；无ThreadLocal，靠 `ServerWebExchange` 透传数据（所以网关不能用ThreadLocal存userId，只能放Header）
+
+1. `getOrder() = -100`：FilteringWebHandler 会按order排序，数值小优先执行，保证鉴权在所有路由过滤器之前
+2. `request.mutate().header()`：底层是 `ServerHttpRequestDecorator`，不可变对象，每次修改都生成新请求对象
+3. `unauthorized()` 调用 `setComplete()`：直接终止Mono流，过滤器链中断，不会走到负载均衡转发逻辑
+4. 全程返回 `Mono<Void>`：响应式流，所有操作都是异步非阻塞链式调用
+
+
+
+gateway网关底层代码
+一、启动阶段：配置加载 & HttpServer 初始化（配置流转链路）
+1. yml 配置
+yaml
+server:
+  port: 8080
+2. ServerProperties（Spring 内置配置绑定类）
+java
+运行
+@ConfigurationProperties(prefix = "server")
+public class ServerProperties {
+	private Integer port;
+	public Integer getPort() {return port;}
+	public void setPort(Integer port) {this.port = port;}
+}
+SpringBoot 自动实例化，自动绑定server.port值。
+3. NettyReactiveWebServerFactory（Spring 自动配置工厂）
+java
+运行
+public class NettyReactiveWebServerFactory implements ReactiveWebServerFactory {
+	private Integer port;
+	public NettyReactiveWebServerFactory(ServerProperties serverProperties) {
+		this.port = serverProperties.getPort();
+	}
+	@Override
+	public ReactiveWebServer getWebServer(HttpHandler httpHandler) {
+		// 1. 创建HttpServer，内部实例空HttpServerConfig
+		HttpServer httpServer = HttpServer.create()
+				// 2. 将yml端口写入HttpServerConfig
+				.port(this.port)
+				// 3. 包装Spring顶层HttpHandler，存入config.handler
+				.handle(new ReactorHttpHandlerAdapter(httpHandler));
+		// 同步绑定端口启动Netty服务
+		DisposableServer disposableServer = httpServer.bindNow();
+		return new NettyReactiveWebServer(disposableServer);
+	}
+}
+4. HttpServer & HttpServerConfig（Reactor 网络配置载体）
+HttpServer
+java
+运行
+public final class HttpServer {
+	private final HttpServerConfig config;
+	private HttpServer(HttpServerConfig config) {this.config = config;}
+	public static HttpServer create() {
+		return new HttpServer(new HttpServerConfig());
+	}
+	public HttpServer port(int port) {
+		this.config.port(port);
+		return this;
+	}
+	public HttpServer handle(HttpHandler handler) {
+		this.config.handler(handler);
+		return this;
+	}
+	public Mono<DisposableServer> bind() {
+		return HttpServerBind.bind(config);
+	}
+}
+HttpServerConfig（全局只读配置，全连接共享）
+java
+运行
+public final class HttpServerConfig extends ServerTransportConfig<HttpServerConfig> {
+	private HttpHandler handler;
+	private HttpDecoderSpec decoderSpec;
+	private boolean wiretap;
+	public HttpServerConfig() {
+		super();
+		this.decoderSpec = new HttpDecoderSpec();
+	}
+	public HttpServerConfig handler(HttpHandler handler) {
+		this.handler = handler;
+		return this;
+	}
+	public HttpHandler handler() {return this.handler;}
+	public HttpServerConfig port(int port) {
+		super.port(port);
+		return this;
+	}
+	public int port() {return super.port();}
+}
+5. HttpServerBind 传递全局 Config 到通道初始化器
+java
+运行
+final class HttpServerBind {
+	static Mono<DisposableServer> bind(HttpServerConfig config) {
+		TcpServer tcpServer = TcpServer.create()
+				.port(config.port())
+				// 把全局配置传入HttpServerChannelInitializer
+				.handle(new HttpServerChannelInitializer(config));
+		return tcpServer.bind().map(DisposableServerImpl::new);
+	}
+}
+启动配置流转总结
+yml server.port → ServerProperties → NettyReactiveWebServerFactory → HttpServer.port()写入HttpServerConfig
+ReactorHttpHandlerAdapter存入HttpServerConfig.handler → HttpServerBind将 config 交给HttpServerChannelInitializer
+二、TCP 连接建立：Channel、ChannelPipeline、ChannelInitializer 关系
+核心概念释义
+Channel：单条客户端 TCP 连接的抽象，一个浏览器连接对应一个独立 Channel，持有 Pipeline
+ChannelPipeline：Channel 内部处理器链表，二进制数据入站 / 出站依次经过链内所有 Handler
+ChannelInitializer<Channel>：Channel 创建时一次性执行的初始化器，仅执行一次，负责给 Pipeline 装配编解码、业务处理器
+HttpServerChannelInitializer 源码（携带全局 HttpServerConfig）
+java
+运行
+final class HttpServerChannelInitializer extends ChannelInitializer<Channel> {
+	private final HttpServerConfig config;
+	HttpServerChannelInitializer(HttpServerConfig config) {
+		this.config = config;
+	}
+	@Override
+	protected void initChannel(Channel ch) throws Exception {
+		ChannelPipeline p = ch.pipeline();
+		// 1. HTTP二进制解码器
+		p.addLast(new HttpServerCodec());
+		// 2. 聚合分段请求体
+		p.addLast(new HttpObjectAggregator(1024*1024));
+		// 3. 业务处理器，传入全局config
+		p.addLast(new HttpServerOperationsHandler(config));
+	}
+}
+TCP 连接创建时序
+Netty 启动监听 8080 端口，注册HttpServerChannelInitializer
+浏览器 TCP 握手成功，Netty 创建Channel ch代表当前 TCP 通道
+自动执行initChannel(ch)，给当前通道 Pipeline 装配全套处理器
+客户端发送 HTTP 二进制ByteBuf，按顺序流经 Pipeline 内 Handler
+
+
+TCP 连接建立：Channel、ChannelPipeline、ChannelInitializer 关系
+核心概念释义
+Channel：单条客户端 TCP 连接的抽象，一个浏览器连接对应一个独立 Channel，持有 Pipeline
+ChannelPipeline：Channel 内部处理器链表，二进制数据入站 / 出站依次经过链内所有 Handler
+ChannelInitializer<Channel>：Channel 创建时一次性执行的初始化器，仅执行一次，负责给 Pipeline 装配编解码、业务处理器
+HttpServerChannelInitializer 源码（携带全局 HttpServerConfig）
+java
+运行
+final class HttpServerChannelInitializer extends ChannelInitializer<Channel> {
+	private final HttpServerConfig config;
+	HttpServerChannelInitializer(HttpServerConfig config) {
+		this.config = config;
+	}
+	@Override
+	protected void initChannel(Channel ch) throws Exception {
+		ChannelPipeline p = ch.pipeline();
+		// 1. HTTP二进制解码器
+		p.addLast(new HttpServerCodec());
+		// 2. 聚合分段请求体
+		p.addLast(new HttpObjectAggregator(1024*1024));
+		// 3. 业务处理器，传入全局config
+		p.addLast(new HttpServerOperationsHandler(config));
+	}
+}
+TCP 连接创建时序
+Netty 启动监听 8080 端口，注册HttpServerChannelInitializer
+浏览器 TCP 握手成功，Netty 创建Channel ch代表当前 TCP 通道
+自动执行initChannel(ch)，给当前通道 Pipeline 装配全套处理器
+客户端发送 HTTP 二进制ByteBuf，按顺序流经 Pipeline 内 Handler
+三、HTTP 报文入站完整执行链路（从字节到网关过滤器）
+步骤 1：HttpServerCodec 二进制 ByteBuf → Netty 原生 HttpRequest
+public class HttpServerCodec extends CombinedChannelDuplexHandler<HttpRequestDecoder, HttpResponseEncoder> {
+    public HttpServerCodec() {
+        super(new HttpRequestDecoder(), new HttpResponseEncoder());
+    }
+}
+// HttpRequestDecoder 实际解析字节，组装Netty请求对象
+public class HttpRequestDecoder extends ReplayingDecoder<Void> {
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf buffer, List<Object> out) throws Exception {
+        // 解析二进制buffer，按HTTP协议拆分请求行、请求头
+        DefaultHttpRequest request = new DefaultHttpRequest(
+                HttpVersion.HTTP_1_1,
+                HttpMethod.GET,
+                "/user/login"
+        );
+        request.headers().add("Authorization", "Bearer xxx");
+        // 将解析完成的Netty请求对象传入下一个Handler
+        out.add(request);
+    }
+}
+步骤 2：HttpServerOperationsHandler 包装 Netty 对象为 Reactor 请求
+java
+运行
+final class HttpServerOperationsHandler extends ChannelDuplexHandler {
+    private final HttpServerConfig config;
+    HttpServerOperationsHandler(HttpServerConfig config) {
+        this.config = config;
+    }
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        // msg 是HttpServerCodec解码生成的Netty HttpRequest
+        if (msg instanceof HttpRequest) {
+            HttpRequest nettyHttpRequest = (HttpRequest) msg;
+            // 包装Reactor内部请求载体，传入全局config、连接上下文、原生请求，把上下文绑定到请求对象
+            HttpServerOperations ops = new HttpServerOperations(ctx, nettyHttpRequest, config);
+            // 从全局config取出ReactorHttpHandlerAdapter，执行跨层转换
+            config.handler().handle(ops, ops).subscribe(new ChannelFutureSubscriber(ctx));
+        }
+    }
+}
+步骤 3：HttpServerOperations（Reactor 层包装对象，持有底层 Netty 请求）
+java
+运行
+final class HttpServerOperations implements HttpServerRequest, HttpServerResponse {
+    private final ChannelHandlerContext ctx;
+    private final HttpRequest nettyRequest;
+    HttpServerOperations(ChannelHandlerContext ctx, HttpRequest nettyRequest, HttpServerConfig config) {
+        this.ctx = ctx;
+        this.nettyRequest = nettyRequest;
+    }
+    @Override
+    public String method() {
+        return nettyRequest.method().name();
+    }
+    @Override
+    public URI uri() {
+        return URI.create(nettyRequest.uri());
+    }
+    @Override
+    public reactor.netty.http.HttpHeaders headers() {
+        return ReactorHttpHeaders.from(nettyRequest.headers());
+    }
+    @Override
+    public Flux<ByteBuf> receive() {
+        // 流式读取TCP原始body字节流
+    }
+}
+步骤 4：ReactorHttpHandlerAdapter（跨层核心桥接：Reactor 对象 → WebFlux 标准对象）
+java
+运行
+package org.springframework.http.server.reactive;
+import reactor.netty.http.server.HttpServerRequest;
+import reactor.netty.http.server.HttpServerResponse;
+import reactor.core.publisher.Mono;
+
+public class ReactorHttpHandlerAdapter implements BiFunction<HttpServerRequest, HttpServerResponse, Mono<Void>> {
+    private final HttpHandler httpHandler;
+    private final DataBufferFactory bufferFactory;
+
+    public ReactorHttpHandlerAdapter(HttpHandler httpHandler) {
+        this.httpHandler = httpHandler;
+        this.bufferFactory = new NettyDataBufferFactory(ByteBufAllocator.DEFAULT);
+    }
+    @Override
+    public Mono<Void> apply(HttpServerRequest reactorReq, HttpServerResponse reactorResp) {
+        // 转换为Spring WebFlux标准请求/响应
+        ServerHttpRequest springRequest = new ReactorServerHttpRequest(reactorReq, bufferFactory);
+        ServerHttpResponse springResponse = new ReactorServerHttpResponse(reactorResp, bufferFactory);
+        // 交给WebFlux顶层处理器继续流转
+        return this.httpHandler.handle(springRequest, springResponse);
+    }
+}
+步骤 5：ReactorServerHttpRequest（过滤器 exchange.getRequest () 实际拿到的实现类）
+public class ReactorServerHttpRequest extends AbstractServerHttpRequest {
+    private final HttpServerRequest reactorRequest;
+    private final DataBufferFactory bufferFactory;
+    public ReactorServerHttpRequest(HttpServerRequest reactorRequest, DataBufferFactory bufferFactory) {
+        super(initUri(reactorRequest), initHeaders(reactorRequest));
+        this.reactorRequest = reactorRequest;
+        this.bufferFactory = bufferFactory;
+    }
+    @Override
+    public HttpMethod getMethod() {
+        return HttpMethod.valueOf(reactorRequest.method());
+    }
+    @Override
+    public String getRawPath() {
+        return reactorRequest.uri().getRawPath();
+    }
+    @Override
+    public Flux<DataBuffer> getBody() {
+        // Netty ByteBuf → Spring DataBuffer，屏蔽底层字节细节
+        return reactorRequest.receive().map(buf -> bufferFactory.wrap(buf.retain()));
+    }
+    @Override
+    public Builder mutate() {
+        return new DefaultServerHttpRequestBuilder(this);
+    }
+}
+步骤 6：HttpWebHandlerAdapter 封装全局上下文 ServerWebExchange
+java
+运行
+public class HttpWebHandlerAdapter implements HttpHandler {
+    private final DispatcherHandler dispatcherHandler;
+    @Override
+    public Mono<Void> handle(ServerHttpRequest request, ServerHttpResponse response) {
+        // 打包请求、响应为唯一上下文，贯穿所有网关过滤器
+        ServerWebExchange exchange = new DefaultServerWebExchange(
+                request,
+                response,
+                new DefaultWebSessionManager(),
+                new ServerCodecConfigurer(),
+                new AcceptHeaderLocaleContextResolver()
+        );
+        // 进入WebFlux调度中心，匹配网关路由、执行全局鉴权过滤器
+        return dispatcherHandler.handle(exchange);
+    }
+}
+四、完整单向执行链路（极简串联）
+启动阶段配置链路
+yml server.port
+→ ServerProperties
+→ NettyReactiveWebServerFactory
+→ HttpServer 写入端口、绑定ReactorHttpHandlerAdapter到HttpServerConfig
+→ HttpServerBind 将全局 config 传入HttpServerChannelInitializer
+→ Netty 启动监听 8080 端口
+请求入站数据流链路
+网卡二进制 ByteBuf
+→ HttpServerCodec 解码 → Netty HttpRequest
+→ HttpServerOperationsHandler 包装 → HttpServerOperations(Reactor HttpServerRequest)
+→ config.handler() 取出ReactorHttpHandlerAdapter.apply()
+→ 适配器构造ReactorServerHttpRequest(WebFlux 标准ServerHttpRequest)
+→ HttpWebHandlerAdapter 封装ServerWebExchange
+→ DispatcherHandler 匹配 yml 路由规则
+→ FilteringWebHandler 组装过滤器链，执行你的AuthGlobalFilter鉴权
+鉴权通过 → 负载均衡转发下游微服务；鉴权失败直接返回 401 终止链路
+五、关键对象层级持有关系（层层包装，源头都是 Netty 解码对象）
+plaintext
+exchange.getRequest() → ReactorServerHttpRequest
+    持有 → HttpServerOperations（Reactor请求）
+        持有 → io.netty.handler.codec.http.HttpRequest（字节解码原始对象）
+六、核心区分总结
+HttpServerConfig：全局只读配置，启动时一次性加载 yml 端口、桥接适配器，所有 TCP 连接共享；
+Channel：单条 TCP 连接专属，每个客户端请求独立 Channel，生命周期随 TCP 连接销毁；
+ChannelInitializer：一次性初始化工具，仅 Channel 创建时装配 Pipeline 处理器；
+HttpServerCodec：底层字节解码器，唯一处理二进制报文的类，产出 Netty 原生 HTTP 对象；
+ReactorHttpHandlerAdapter：跨层桥接核心，打通 Netty/Reactor 网络层与 Spring WebFlux 网关业务层。
+
+
+一、Netty 底层缺失类补齐
+1. ByteBuf（网卡二进制载体，省略完整实现，只看作用）
+Netty 存放 TCP 二进制字节的容器，客户端 HTTP 报文原始载体
+java
+运行
+package io.netty.buffer;
+public abstract class ByteBuf {
+    // 存储二进制字节流，HttpServerCodec读取此对象解析HTTP
+    public abstract byte readByte();
+}
+2. DefaultHttpRequest（HttpServerCodec 解码生成的原生 HTTP 对象）
+java
+运行
+package io.netty.handler.codec.http;
+import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http.HttpMethod;
+
+public class DefaultHttpRequest implements HttpRequest {
+    private final HttpVersion protocolVersion;
+    private final HttpMethod method;
+    private final String uri;
+    private final HttpHeaders headers;
+
+    public DefaultHttpRequest(HttpVersion version, HttpMethod method, String uri) {
+        this.protocolVersion = version;
+        this.method = method;
+        this.uri = uri;
+        this.headers = new DefaultHttpHeaders();
+    }
+
+    @Override
+    public HttpMethod method() {
+        return method;
+    }
+
+    @Override
+    public String uri() {
+        return uri;
+    }
+
+    @Override
+    public HttpVersion protocolVersion() {
+        return protocolVersion;
+    }
+
+    @Override
+    public HttpHeaders headers() {
+        return headers;
+    }
+}
+3. ChannelHandlerContext ctx（每一条 TCP 连接上下文，handler 入参 ctx 来源）
+java
+运行
+package io.netty.channel;
+public interface ChannelHandlerContext {
+    // 当前绑定的TCP通道
+    Channel channel();
+    // 向下传递数据
+    ChannelPipeline pipeline();
+    // 写出响应数据
+    ChannelFuture write(Object msg);
+    // 刷新缓冲区
+    ChannelFuture flush();
+}
+ctx：Netty 自动传入 channelRead(ChannelHandlerContext ctx, Object msg)
+msg：流水线上游传递过来的数据，这里是解码后的 DefaultHttpRequest
+4. Object msg 说明
+Object 是所有 Java 对象父类，流水线流转数据统一用 Object 接收，运行时真实类型：
+入站：DefaultHttpRequest / HttpContent
+代码强转：HttpRequest nettyHttpRequest = (HttpRequest) msg;
+二、Reactor 缺失顶层接口：HttpServerRequest、HttpServerResponse
+1. reactor.netty.http.server.HttpServerRequest
+java
+运行
+package reactor.netty.http.server;
+import reactor.core.publisher.Flux;
+import reactor.netty.http.HttpHeaders;
+import io.netty.buffer.ByteBuf;
+import java.net.URI;
+
+public interface HttpServerRequest {
+    // 请求方法 GET/POST
+    String method();
+    // 请求完整URI
+    URI uri();
+    // 请求头集合
+    HttpHeaders headers();
+    // 流式读取原始TCP body字节流
+    Flux<ByteBuf> receive();
+}
+2. reactor.netty.http.server.HttpServerResponse
+java
+运行
+package reactor.netty.http.server;
+import reactor.core.publisher.Mono;
+import reactor.netty.http.HttpHeaders;
+import io.netty.buffer.ByteBuf;
+
+public interface HttpServerResponse {
+    // 设置响应状态码
+    HttpServerResponse status(int code);
+    // 写入响应体字节流
+    Mono<Void> send(Flux<ByteBuf> body);
+    // 响应头
+    HttpHeaders headers();
+}
+3. BiFunction 函数式接口（ReactorHttpHandlerAdapter 父接口）
+java
+运行
+package java.util.function;
+public interface BiFunction<T, U, R> {
+    // T=HttpServerRequest U=HttpServerResponse R=Mono<Void>
+    R apply(T t, U u);
+}
+
+
+# 补齐缺失：HttpHandler、DefaultServerWebExchange、配套依赖类完整源码
+. HttpHandler（WebFlux顶层统一入口接口）
+全路径：`org.springframework.web.server.HttpHandler`
+所有网络层最终都会调用该接口 `handle`，是Netty和Spring WebFlux的顶层契约
+```java
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import reactor.core.publisher.Mono;
+
+public interface HttpHandler {
+    // 入参：转换完成的WebFlux标准请求/响应
+    Mono<Void> handle(ServerHttpRequest request, ServerHttpResponse response);
+}
+```
+### 实现类：HttpWebHandlerAdapter
+```java
+import org.springframework.web.reactive.DispatcherHandler;
+import org.springframework.web.server.adapter.DefaultServerWebExchange;
+import org.springframework.web.server.session.DefaultWebSessionManager;
+import org.springframework.web.server.ServerWebExchange;
+import org.springframework.web.server.WebSessionManager;
+import org.springframework.web.server.i18n.AcceptHeaderLocaleContextResolver;
+import org.springframework.web.server.i18n.LocaleContextResolver;
+import org.springframework.http.codec.ServerCodecConfigurer;
+
+public class HttpWebHandlerAdapter implements HttpHandler {
+
+    private final DispatcherHandler dispatcherHandler;
+    private final WebSessionManager sessionManager = new DefaultWebSessionManager();
+    private final ServerCodecConfigurer codecConfigurer = ServerCodecConfigurer.create();
+    private final LocaleContextResolver localeResolver = new AcceptHeaderLocaleContextResolver();
+
+    public HttpWebHandlerAdapter(DispatcherHandler dispatcherHandler) {
+        this.dispatcherHandler = dispatcherHandler;
+    }
+
+    @Override
+    public Mono<Void> handle(ServerHttpRequest request, ServerHttpResponse response) {
+        // 构建全局上下文 ServerWebExchange
+        ServerWebExchange exchange = new DefaultServerWebExchange(
+                request,
+                response,
+                this.sessionManager,
+                this.codecConfigurer,
+                this.localeResolver
+        );
+        // 交给WebFlux调度中心匹配路由、执行过滤器
+        return this.dispatcherHandler.handle(exchange);
+    }
+}
+```
+
+ DefaultServerWebExchange（exchange 实际实现类）
+全路径：`org.springframework.web.server.adapter.DefaultServerWebExchange`
+贯穿网关全流程的上下文容器，持有request、response、会话、编码、国际化解析器
+```java
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.web.server.ServerWebExchange;
+import org.springframework.web.server.WebSession;
+import org.springframework.web.server.session.WebSessionManager;
+import org.springframework.http.codec.ServerCodecConfigurer;
+import org.springframework.web.server.i18n.LocaleContextResolver;
+import reactor.core.publisher.Mono;
+import java.util.Map;
+
+public class DefaultServerWebExchange implements ServerWebExchange {
+
+    private final ServerHttpRequest request;
+    private final ServerHttpResponse response;
+    private final WebSessionManager sessionManager;
+    private final ServerCodecConfigurer codecConfigurer;
+    private final LocaleContextResolver localeResolver;
+    // 自定义属性，过滤器中 exchange.getAttribute() / setAttribute()
+    private final Map<String, Object> attributes;
+
+    // 就是你看到的五参构造
+    public DefaultServerWebExchange(
+            ServerHttpRequest request,
+            ServerHttpResponse response,
+            WebSessionManager sessionManager,
+            ServerCodecConfigurer codecConfigurer,
+            LocaleContextResolver localeResolver
+    ) {
+        this.request = request;
+        this.response = response;
+        this.sessionManager = sessionManager;
+        this.codecConfigurer = codecConfigurer;
+        this.localeResolver = localeResolver;
+        this.attributes = new java.util.HashMap<>();
+    }
+
+    // 过滤器 exchange.getRequest() 底层调用
+    @Override
+    public ServerHttpRequest getRequest() {
+        return this.request;
+    }
+
+    @Override
+    public ServerHttpResponse getResponse() {
+        return this.response;
+    }
+
+    // 存取自定义属性（可临时存数据，不推荐存用户信息，无ThreadLocal）
+    @Override
+    public Map<String, Object> getAttributes() {
+        return this.attributes;
+    }
+
+    // Session会话
+    @Override
+    public Mono<WebSession> getSession() {
+        return this.sessionManager.getSession(this);
+    }
+
+    @Override
+    public ServerCodecConfigurer getCodecConfigurer() {
+        return this.codecConfigurer;
+    }
+
+    @Override
+    public LocaleContextResolver getLocaleContextResolver() {
+        return this.localeResolver;
+    }
+
+    // 复制exchange，替换新request（你添加X-User-Id时 exchange.mutate().request(mutatedReq).build()）
+    @Override
+    public Builder mutate() {
+        return new DefaultServerWebExchangeBuilder(this);
+    }
+}
+```
+
+. 构造传入的三个配套参数类源码
+# DefaultWebSessionManager（会话管理器）
+```java
+import org.springframework.web.server.WebSession;
+import org.springframework.web.server.WebSessionManager;
+import reactor.core.publisher.Mono;
+
+public class DefaultWebSessionManager implements WebSessionManager {
+    @Override
+    public Mono<WebSession> getSession(ServerWebExchange exchange) {
+        // 创建/读取当前请求会话
+        return Mono.just(new DefaultWebSession());
+    }
+}
+```
+
+ ServerCodecConfigurer（JSON/序列化、body编解码配置）
+```java
+import org.springframework.http.codec.ClientCodecConfigurer;
+import org.springframework.http.codec.ServerCodecConfigurer;
+
+public interface ServerCodecConfigurer extends ClientCodecConfigurer {
+    static ServerCodecConfigurer create() {
+        return new DefaultServerCodecConfigurer();
+    }
+}
+```
+
+ AcceptHeaderLocaleContextResolver（国际化解析，读取Accept-Language头）
+```java
+import org.springframework.web.server.i18n.LocaleContextResolver;
+import org.springframework.web.server.ServerWebExchange;
+import java.util.Locale;
+
+public class AcceptHeaderLocaleContextResolver implements LocaleContextResolver {
+    @Override
+    public Locale resolveLocaleContext(ServerWebExchange exchange) {
+        String acceptLang = exchange.getRequest().getHeaders().getFirst("Accept-Language");
+        if (acceptLang == null) {
+            return Locale.getDefault();
+        }
+        return Locale.forLanguageTag(acceptLang.split(",")[0]);
+    }
+}
+```
+
+ 顶层接口 ServerWebExchange（过滤器中使用的接口）
+```java
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.web.server.WebSession;
+import org.springframework.http.codec.ServerCodecConfigurer;
+import org.springframework.web.server.i18n.LocaleContextResolver;
+import reactor.core.publisher.Mono;
+import java.util.Map;
+
+public interface ServerWebExchange {
+    ServerHttpRequest getRequest();
+    ServerHttpResponse getResponse();
+    Map<String, Object> getAttributes();
+    Mono<WebSession> getSession();
+    ServerCodecConfigurer getCodecConfigurer();
+    LocaleContextResolver getLocaleContextResolver();
+    // 修改request/response，生成新exchange
+    Builder mutate();
+
+    interface Builder {
+        Builder request(ServerHttpRequest request);
+        ServerWebExchange build();
+    }
+}
+```
+
+串联关系说明
+1. `ReactorHttpHandlerAdapter.apply()` 拿到 `ReactorServerHttpRequest / ReactorServerHttpResponse`
+2. 调用 `this.httpHandler.handle(springReq, springResp)`，这里的 `httpHandler` 实现是 `HttpWebHandlerAdapter`
+3. `HttpWebHandlerAdapter.handle` 内部 new `DefaultServerWebExchange`，把请求、响应、会话、编码、国际化全部打包进一个上下文对象
+4. `exchange` 完整传递到 `DispatcherHandler` → 路由匹配 → `FilteringWebHandler` → 你的 `AuthGlobalFilter`
+5. 过滤器中 `exchange.getRequest()` 拿到包装后的WebFlux请求对象，层层追溯源头是Netty解码的 `DefaultHttpRequest`
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 ## 22  底层补习总览(本章及之后全是新增) <a id="sec174"></a>
 

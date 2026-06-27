@@ -18,6 +18,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -237,6 +238,24 @@ public class SeckillActivityServiceImpl
         result.put("orderNo", null);
         result.put("message", "未抢到, 请下次再来");
         return result;
+    }
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void paySeckillOrder(Long userId, String orderNo) {
+        QueryWrapper<SeckillOrder> w = new QueryWrapper<>();
+        w.eq("order_no", orderNo).eq("user_id", userId);
+        SeckillOrder order = seckillOrderMapper.selectOne(w);
+
+        if (order == null) {
+            throw new BusinessException(404, "订单不存在");
+        }
+        if (order.getStatus() != 0) {
+            throw new BusinessException(400, "订单状态异常，无法支付");
+        }
+
+        order.setStatus((byte) 1);
+        order.setPayTime(LocalDateTime.now());
+        seckillOrderMapper.updateById(order);
     }
 
     /** 状态码翻译成中文 */

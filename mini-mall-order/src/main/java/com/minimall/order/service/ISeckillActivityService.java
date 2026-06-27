@@ -30,4 +30,9 @@ public interface ISeckillActivityService extends IService<SeckillActivity> {
 
     /** ④ 查"我"的秒杀结果, 3 态 SUCCESS/PROCESSING/NOT_FOUND */
     Map<String, Object> querySeckillResult(Long userId, Long activityId);
+
+
+    // ISeckillActivityService
+    /** ⑤ 秒杀订单支付 */
+    void paySeckillOrder(Long userId, String orderNo);
 }

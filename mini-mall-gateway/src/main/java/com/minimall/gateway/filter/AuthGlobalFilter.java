@@ -5,6 +5,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.stereotype.Component;
@@ -12,6 +13,7 @@ import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
 import java.util.List;
+import java.util.Set;
 
 /**
  * 全局鉴权过滤器
@@ -40,23 +42,24 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
 
     /**
      * 白名单：这些 path 不校验 token，直接放行
-     *
+     * <p>
      * ⭐ TODO ①：你来填白名单数组
-     *   提示：根据 D3 路线图，至少要放行登录和注册
-     *   写法：List.of("/user/login", "/user/register")
+     * 提示：根据 D3 路线图，至少要放行登录和注册
+     * 写法：List.of("/user/login", "/user/register")
      */
-    private static final List<String> WHITE_LIST = List.of(
-            // ⭐ AUTH 阶段: 认证服务整段放行 (login/register/oauth 全在 /auth/** 下)
-            "/auth",
-            // G3.1: 商品分类对游客也可见 (列表/详情)
-            // 注: startsWith 会把 POST/PUT/DELETE 也放过, 教学项目暂不区分
-            //     生产环境应该用 method + path 双维度白名单
-            "/category",
-            // ⭐ G7 新增: 游客可看商品评价列表 (POST /review 写评价不受影响, 因为路径不同前缀)
-            "/review/product",
-            // ⭐ G8 新增: 游客可看当前可领的券 (领券/我的券/internal 因路径前缀不同仍需 token)
-            "/coupon/available"
+    private record WhitelistRule(String prefix, Set<HttpMethod> methods) {
+    }
+
+    private static final List<WhitelistRule> WHITE_LIST = List.of(
+            new WhitelistRule("/auth", null),                              // 登录注册, 不限 method
+            new WhitelistRule("/category", Set.of(HttpMethod.GET)),
+            new WhitelistRule("/product", Set.of(HttpMethod.GET)),         // ← 新增
+            new WhitelistRule("/search/product", Set.of(HttpMethod.GET)),  // ← 新增
+            new WhitelistRule("/review/product", Set.of(HttpMethod.GET)),
+            new WhitelistRule("/coupon/available", Set.of(HttpMethod.GET))
+
     );
+
 
     /**
      * 黑名单: 这些 path 直接 403, 不允许外部访问
@@ -88,7 +91,10 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
         //         或者用一个 for 循环判断
         // 在白名单 → 不校验，直接走下游
         // [你的代码写这里]
-        boolean inWhiteList = WHITE_LIST.stream().anyMatch(path::startsWith);
+        HttpMethod method = request.getMethod();
+        boolean inWhiteList = WHITE_LIST.stream().anyMatch(r ->
+                path.startsWith(r.prefix()) && (r.methods() == null || r.methods().contains(method))
+        );
         if (inWhiteList) {
             return chain.filter(exchange);
         }

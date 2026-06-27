@@ -124,7 +124,12 @@ public class AddressController {
         addressService.removeById(id);  // 实际执行 UPDATE ... SET is_deleted=1
         return Result.success();
     }
-
+    @PutMapping("/default")
+    public Result<Void> setDefault(@RequestParam Long addressId) {
+        Long userId = SecurityContextHolder.getUserId();
+        addressService.setDefaultAddress(userId, addressId);
+        return Result.success();
+    }
     // ═════════════════════════════════════════════════════════
     // 私有工具: 查 + 越权校验
     // ═════════════════════════════════════════════════════════

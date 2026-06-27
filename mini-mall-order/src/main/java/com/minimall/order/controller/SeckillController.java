@@ -56,4 +56,12 @@ public class SeckillController {
         Long userId= SecurityContextHolder.getUserId();
         return Result.success(seckillActivityService.querySeckillResult(userId, activityId));
     }
+
+    /** ⑤ 秒杀订单支付 */
+    @PostMapping("/pay/{orderNo}")
+    public Result<Void> paySeckillOrder(@PathVariable String orderNo) {
+        Long userId = SecurityContextHolder.getUserId();
+        seckillActivityService.paySeckillOrder(userId, orderNo);
+        return Result.success();
+    }
 }

@@ -131,6 +131,9 @@ public class AuthController {
         User newUser = new User();
         newUser.setUsername(dto.getUsername());
         newUser.setPassword(encryptedPassword);
+        // C 端 WEB.2 注册表单可选字段; null 直接传给 user 服务, DB 字段允许 null
+        newUser.setPhone(dto.getPhone());
+        newUser.setNickname(dto.getNickname());
         newUser.setRole((byte) 0);
         newUser.setStatus((byte) 1);
         newUser.setCreateTime(LocalDateTime.now());

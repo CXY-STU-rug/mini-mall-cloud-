@@ -4,14 +4,15 @@ import com.minimall.common.core.context.SecurityContextHolder;
 import com.minimall.common.core.domain.Result;
 import com.minimall.common.core.exception.BusinessException;
 import com.minimall.user.client.ProductFeignClient;
+import com.minimall.user.dto.UserProfileUpdateDTO;
 import com.minimall.user.entity.User;
 import com.minimall.user.mapper.UserMapper;
 import com.minimall.user.service.IUserService;
+import com.minimall.user.vo.UserProfileVO;
+import jakarta.validation.Valid;
+import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -45,15 +46,36 @@ public class UserController {
      * ⭐ D4 验证接口: 检验 X-User-Id 是否真的从网关透传过来
      */
     @GetMapping("/me")
-    public Result<Map<String, Object>> me() {
+    public Result<UserProfileVO> me() {                          // ← 改: 返 VO
         Long userId = SecurityContextHolder.getUserId();
-        System.out.println("[user/me] 收到的 X-User-Id = " + userId);
-        Map<String, Object> data = new HashMap<>();
-        data.put("userId", userId);
-        data.put("source", "X-User-Id header (透传自 gateway)");
-        return Result.success(data);
+        User user = userMapper.selectById(userId);
+        if (user == null) {
+            throw new BusinessException("用户不存在");
+        }
+        // entity → VO, 用 Spring 自带工具按字段名拷, 敏感字段自动被丢弃
+        UserProfileVO vo = new UserProfileVO();
+        BeanUtils.copyProperties(user, vo);
+        return Result.success(vo);
     }
+    @PutMapping("/me")
+    public Result<Void> updateMe(@Valid @RequestBody UserProfileUpdateDTO dto) {
+        // ⭐ TODO ①: 从 SecurityContextHolder 拿当前 userId
+        //   提示: 跟 me() 方法一样
+        Long userId = SecurityContextHolder.getUserId();
 
+        // 组装更新对象, 只放允许字段, role/status/password 永远不动
+        User update = new User();
+        update.setId(userId);
+        update.setNickname(dto.getNickname());
+        update.setPhone(dto.getPhone());
+        update.setEmail(dto.getEmail());
+        update.setAvatar(dto.getAvatar());
+        // ⭐ TODO ②: 调 userService.updateById(update)
+        //   提示: MP 默认空字段不更新, dto 没传的字段不会被覆盖
+        userService.updateById(update);
+
+        return Result.success();
+    }
     /** 按 id 查 */
     @GetMapping("/{id}")
     public Result<User> getById(@PathVariable("id") Long id) {
